@@ -16,6 +16,7 @@ client in `docs/DESIGN.md`.
   epochs, lifecycle timers, recreate-from-token.
 - `src/internal/turnstile/` — Cloudflare Turnstile siteverify client.
 - `src/internal/metrics/` — Prometheus instruments.
+- `src/internal/requestlog/` — JSON request logging (HTTP + WebSocket).
 - `src/internal/server/` — WebSocket endpoint, origin check, handshake timeout,
   read/write loops, `/healthz`, `/metrics`.
 

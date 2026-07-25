@@ -1,21 +1,44 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/kku1993/simple-peer-signal-server/internal/config"
 	"github.com/kku1993/simple-peer-signal-server/internal/metrics"
+	"github.com/kku1993/simple-peer-signal-server/internal/requestlog"
 	"github.com/kku1993/simple-peer-signal-server/internal/room"
 	"github.com/kku1993/simple-peer-signal-server/internal/tombstone"
 	"github.com/kku1993/simple-peer-signal-server/internal/token"
 	"github.com/gorilla/websocket"
 )
+
+// lockedBuffer is a concurrency-safe bytes.Buffer suitable for capturing log
+// output from multiple goroutines (the HTTP middleware + WS read loops run on
+// separate goroutines).
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
 
 func testConfig() config.Config {
 	return config.Config{
@@ -52,7 +75,7 @@ func newTestServer(t *testing.T, cfg config.Config) (*httptest.Server, *room.Reg
 	reg := room.New(cfg, signer, tomb, m)
 	reg.StartSweep()
 	t.Cleanup(reg.Stop)
-	srv := New(cfg, reg, m, nil)
+	srv := New(cfg, reg, m, nil, nil)
 	hs := httptest.NewServer(http.HandlerFunc(srv.handleSignal))
 	t.Cleanup(hs.Close)
 	return hs, reg
@@ -200,7 +223,7 @@ func TestServerHealthz(t *testing.T) {
 	m := metrics.New()
 	tomb := tombstone.New(cfg.TombstoneMaxEntries, cfg.TombstoneTtl())
 	reg := room.New(cfg, signer, tomb, m)
-	srv := New(cfg, reg, m, nil)
+	srv := New(cfg, reg, m, nil, nil)
 	hs := httptest.NewServer(http.HandlerFunc(srv.handleHealth))
 	defer hs.Close()
 
@@ -302,5 +325,163 @@ func TestServerRejoinLiveRoom(t *testing.T) {
 	}
 	if rr["roomId"] != roomID {
 		t.Errorf("roomId = %v, want %s", rr["roomId"], roomID)
+	}
+}
+
+// TestServerRequestLog verifies that the JSON request logger records both the
+// HTTP upgrade (status 101) and each inbound WebSocket message with its
+// response type, close code, and rejection reason.
+func TestServerRequestLog(t *testing.T) {
+	cfg := testConfig()
+	signer, _ := token.NewSigner(cfg.ServerSecret)
+	m := metrics.New()
+	tomb := tombstone.New(cfg.TombstoneMaxEntries, cfg.TombstoneTtl())
+	reg := room.New(cfg, signer, tomb, m)
+	reg.StartSweep()
+	t.Cleanup(reg.Stop)
+
+	logBuf := &lockedBuffer{}
+	srv := New(cfg, reg, m, nil, requestlog.New(logBuf))
+	hs := httptest.NewServer(srv.reqLog.Middleware(srv.resolveIP, http.HandlerFunc(srv.handleSignal)))
+	t.Cleanup(hs.Close)
+
+	host := dial(t, hs)
+	defer host.Close()
+	guest := dial(t, hs)
+	defer guest.Close()
+
+	sendMsg(t, host, map[string]any{"type": "create-room", "hostEpoch": "h1"})
+	cr := recvMsg(t, host)
+	roomID := cr["roomId"].(string)
+
+	sendMsg(t, guest, map[string]any{
+		"type": "join-room", "roomId": roomID, "guestEpoch": "g1",
+	})
+	_ = recvMsg(t, guest) // join-room-response
+	_ = recvMsg(t, host)  // guest-joined
+
+	// Send an unknown message type to trigger an error-response with a reason.
+	sendMsg(t, host, map[string]any{"type": "frobnicate"})
+	_ = recvMsg(t, host) // error-response
+
+	sendMsg(t, host, map[string]any{"type": "close-room"})
+	checkClose(t, host, 4013)
+	checkClose(t, guest, 4013)
+
+	// Give the writer goroutines a moment to flush, then drain the buffer.
+	time.Sleep(20 * time.Millisecond)
+
+	var httpCount, wsCount int
+	var sawUpgrade, sawCreateResp, sawCloseRoom, sawClose4013, sawUnknownReason, sawCloseReason bool
+	for _, line := range strings.Split(strings.TrimRight(logBuf.String(), "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		var e map[string]any
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("unmarshal %q: %v", line, err)
+		}
+		switch e["kind"] {
+		case "http":
+			httpCount++
+			if e["path"] == "/v1/signal" && e["status"].(float64) == 101 {
+				sawUpgrade = true
+			}
+		case "ws":
+			wsCount++
+			if e["msgType"] == "create-room" && e["responseType"] == "create-room-response" {
+				sawCreateResp = true
+				if e["roomId"] != roomID {
+					t.Errorf("create-room log roomId = %v, want %s", e["roomId"], roomID)
+				}
+			}
+			if e["msgType"] == "close-room" {
+				sawCloseRoom = true
+			}
+			if e["msgType"] == "frobnicate" && e["reason"] != nil {
+				if strings.Contains(e["reason"].(string), "unknown message type") {
+					sawUnknownReason = true
+				}
+			}
+			// The registry closes both sockets with 4013 as a side effect
+			// of close-room; the read loop emits a final "close" entry.
+			if e["msgType"] == "close" && e["closeCode"] != nil && e["closeCode"].(float64) == 4013 {
+				sawClose4013 = true
+				if e["reason"] != nil && strings.Contains(e["reason"].(string), "room closed") {
+					sawCloseReason = true
+				}
+			}
+		}
+	}
+
+	if !sawUpgrade {
+		t.Errorf("expected an http log entry for the WS upgrade (status 101); httpCount=%d", httpCount)
+	}
+	if !sawCreateResp {
+		t.Errorf("expected a ws log entry for create-room with responseType=create-room-response; wsCount=%d", wsCount)
+	}
+	if !sawCloseRoom {
+		t.Errorf("expected a ws log entry for close-room")
+	}
+	if !sawClose4013 {
+		t.Errorf("expected a ws close entry with closeCode=4013; wsCount=%d", wsCount)
+	}
+	if !sawCloseReason {
+		t.Errorf("expected a ws close entry with reason containing 'room closed'")
+	}
+	if !sawUnknownReason {
+		t.Errorf("expected a ws log entry for unknown message type with a reason")
+	}
+}
+
+// TestServerRequestLogHTTPRejection verifies that rejected HTTP requests log
+// a human-readable reason.
+func TestServerRequestLogHTTPRejection(t *testing.T) {
+	cfg := testConfig()
+	cfg.AllowedOrigins = []string{"https://allowed.example.com"}
+	signer, _ := token.NewSigner(cfg.ServerSecret)
+	m := metrics.New()
+	tomb := tombstone.New(cfg.TombstoneMaxEntries, cfg.TombstoneTtl())
+	reg := room.New(cfg, signer, tomb, m)
+	reg.StartSweep()
+	t.Cleanup(reg.Stop)
+
+	logBuf := &lockedBuffer{}
+	srv := New(cfg, reg, m, nil, requestlog.New(logBuf))
+	hs := httptest.NewServer(srv.reqLog.Middleware(srv.resolveIP, http.HandlerFunc(srv.handleSignal)))
+	t.Cleanup(hs.Close)
+
+	// Disallowed origin → 403 with reason.
+	req, _ := http.NewRequest("GET", hs.URL+"/v1/signal", nil)
+	req.Header.Set("Origin", "https://evil.example.com")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("do: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", resp.StatusCode)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+
+	var found bool
+	for _, line := range strings.Split(strings.TrimRight(logBuf.String(), "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		var e map[string]any
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("unmarshal %q: %v", line, err)
+		}
+		if e["kind"] == "http" && e["status"].(float64) == 403 {
+			reason, _ := e["reason"].(string)
+			if strings.Contains(reason, "origin not allowed") && strings.Contains(reason, "https://evil.example.com") {
+				found = true
+			}
+		}
+	}
+	if !found {
+		t.Errorf("expected an http 403 log entry with reason 'origin not allowed: https://evil.example.com'; buf=%s", logBuf.String())
 	}
 }

@@ -10,8 +10,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"reflect"
 	"strconv"
 	"sync"
 	"time"
@@ -19,6 +21,7 @@ import (
 	"github.com/kku1993/simple-peer-signal-server/internal/config"
 	"github.com/kku1993/simple-peer-signal-server/internal/metrics"
 	"github.com/kku1993/simple-peer-signal-server/internal/protocol"
+	"github.com/kku1993/simple-peer-signal-server/internal/requestlog"
 	"github.com/kku1993/simple-peer-signal-server/internal/room"
 	"github.com/kku1993/simple-peer-signal-server/internal/turnstile"
 	"github.com/gorilla/websocket"
@@ -36,13 +39,14 @@ type Server struct {
 	registry  *room.Registry
 	metrics   *metrics.Metrics
 	turnstile *turnstile.Client
+	reqLog    *requestlog.Logger
 
 	httpServer *http.Server
 }
 
-// New constructs a Server.
-func New(cfg config.Config, reg *room.Registry, m *metrics.Metrics, ts *turnstile.Client) *Server {
-	return &Server{cfg: cfg, registry: reg, metrics: m, turnstile: ts}
+// New constructs a Server. reqLog may be nil to disable request logging.
+func New(cfg config.Config, reg *room.Registry, m *metrics.Metrics, ts *turnstile.Client, reqLog *requestlog.Logger) *Server {
+	return &Server{cfg: cfg, registry: reg, metrics: m, turnstile: ts, reqLog: reqLog}
 }
 
 // ListenAndServe starts the HTTP server. It blocks until Shutdown is called.
@@ -52,9 +56,11 @@ func (s *Server) ListenAndServe() error {
 	mux.Handle("/metrics", s.metrics.Handler())
 	mux.HandleFunc("/v1/signal", s.handleSignal)
 
+	handler := s.reqLog.Middleware(s.resolveIP, mux)
+
 	s.httpServer = &http.Server{
 		Addr:    s.cfg.ListenAddr,
-		Handler: mux,
+		Handler: handler,
 	}
 
 	log.Printf("listening on %s", s.cfg.ListenAddr)
@@ -82,6 +88,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
 	// Origin check, before the upgrade.
 	if !s.cfg.OriginAllowed(r.Header.Get("Origin")) {
+		origin := r.Header.Get("Origin")
+		if rec, ok := w.(*requestlog.StatusRecorder); ok {
+			rec.SetReason("origin not allowed: " + origin)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusForbidden)
 		_ = json.NewEncoder(w).Encode(map[string]any{
@@ -97,6 +107,9 @@ func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
 
 	// Per-IP handshake rate limit.
 	if ok, wait := s.registry.AllowHandshake(ip); !ok {
+		if rec, ok := w.(*requestlog.StatusRecorder); ok {
+			rec.SetReason(fmt.Sprintf("handshake rate limited (retry after %ds)", int(wait.Seconds())+1))
+		}
 		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())))
 		w.WriteHeader(http.StatusTooManyRequests)
 		s.metrics.RateLimitRejects.Inc()
@@ -105,6 +118,9 @@ func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
 
 	// Global connection cap.
 	if !s.registry.IncConnections() {
+		if rec, ok := w.(*requestlog.StatusRecorder); ok {
+			rec.SetReason("server at capacity (max connections reached)")
+		}
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
@@ -115,6 +131,9 @@ func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		s.registry.DecConnections()
+		if rec, ok := w.(*requestlog.StatusRecorder); ok {
+			rec.SetReason("websocket upgrade failed: " + err.Error())
+		}
 		return
 	}
 	conn.SetReadLimit(int64(s.cfg.MaxFrameBytes))
@@ -181,11 +200,13 @@ func trimSpace(s string) string {
 	return s[i:j]
 }
 
-// dispatch routes an inbound JSON message to the appropriate handler.
-func (s *Server) dispatch(sess *room.Session, c *wsConn, raw []byte) room.Result {
+// dispatch routes an inbound JSON message to the appropriate handler. The
+// parsed Envelope is returned alongside the Result so the caller can log the
+// inbound message type / request ID even when the handler returns an error.
+func (s *Server) dispatch(sess *room.Session, c *wsConn, raw []byte) (protocol.Envelope, room.Result) {
 	var env protocol.Envelope
 	if err := json.Unmarshal(raw, &env); err != nil {
-		return room.Result{Response: protocol.NewError(protocol.ErrMalformedMessage, "malformed JSON", "", nil)}
+		return protocol.Envelope{}, room.Result{Response: protocol.NewError(protocol.ErrMalformedMessage, "malformed JSON: "+err.Error(), "", nil)}
 	}
 	env.Raw = raw
 
@@ -193,7 +214,7 @@ func (s *Server) dispatch(sess *room.Session, c *wsConn, raw []byte) room.Result
 	case protocol.TypeCreateRoom:
 		var m protocol.CreateRoomMsg
 		if err := json.Unmarshal(raw, &m); err != nil {
-			return errResp(protocol.ErrMalformedMessage, "malformed create-room", env.RequestID)
+			return env, errResp(protocol.ErrMalformedMessage, "malformed create-room: "+err.Error(), env.RequestID)
 		}
 		turnstileOK := true
 		if s.cfg.TurnstileSecretKey != "" {
@@ -206,50 +227,98 @@ func (s *Server) dispatch(sess *room.Session, c *wsConn, raw []byte) room.Result
 				}
 			}
 		}
-		return s.registry.CreateRoom(sess, m, turnstileOK)
+		return env, s.registry.CreateRoom(sess, m, turnstileOK)
 
 	case protocol.TypeJoinRoom:
 		var m protocol.JoinRoomMsg
 		if err := json.Unmarshal(raw, &m); err != nil {
-			return errResp(protocol.ErrMalformedMessage, "malformed join-room", env.RequestID)
+			return env, errResp(protocol.ErrMalformedMessage, "malformed join-room: "+err.Error(), env.RequestID)
 		}
-		return s.registry.JoinRoom(sess, m)
+		return env, s.registry.JoinRoom(sess, m)
 
 	case protocol.TypeRejoinRoom:
 		var m protocol.RejoinRoomMsg
 		if err := json.Unmarshal(raw, &m); err != nil {
-			return errResp(protocol.ErrMalformedMessage, "malformed rejoin-room", env.RequestID)
+			return env, errResp(protocol.ErrMalformedMessage, "malformed rejoin-room: "+err.Error(), env.RequestID)
 		}
-		return s.registry.RejoinRoom(sess, m)
+		return env, s.registry.RejoinRoom(sess, m)
 
 	case protocol.TypeSignal:
 		var m protocol.SignalMsg
 		if err := json.Unmarshal(raw, &m); err != nil {
-			return errResp(protocol.ErrMalformedMessage, "malformed signal", env.RequestID)
+			return env, errResp(protocol.ErrMalformedMessage, "malformed signal: "+err.Error(), env.RequestID)
 		}
-		return s.registry.Signal(sess, m)
+		return env, s.registry.Signal(sess, m)
 
 	case protocol.TypePeerConnected:
 		var m protocol.PeerConnectedMsg
 		if err := json.Unmarshal(raw, &m); err != nil {
-			return errResp(protocol.ErrMalformedMessage, "malformed peer-connected", env.RequestID)
+			return env, errResp(protocol.ErrMalformedMessage, "malformed peer-connected: "+err.Error(), env.RequestID)
 		}
-		return s.registry.PeerConnected(sess, m)
+		return env, s.registry.PeerConnected(sess, m)
 
 	case protocol.TypeCloseRoom:
 		var m protocol.CloseRoomMsg
 		if err := json.Unmarshal(raw, &m); err != nil {
-			return errResp(protocol.ErrMalformedMessage, "malformed close-room", env.RequestID)
+			return env, errResp(protocol.ErrMalformedMessage, "malformed close-room: "+err.Error(), env.RequestID)
 		}
-		return s.registry.CloseRoom(sess, m)
+		return env, s.registry.CloseRoom(sess, m)
 
 	default:
-		return errResp(protocol.ErrUnknownMessageType, "unknown message type: "+env.Type, env.RequestID)
+		return env, errResp(protocol.ErrUnknownMessageType, "unknown message type: "+env.Type, env.RequestID)
 	}
 }
 
 func errResp(code protocol.ErrorCode, msg, reqID string) room.Result {
 	return room.Result{Response: protocol.NewError(code, msg, reqID, nil)}
+}
+
+// logWS emits a JSON request-log entry for one inbound WebSocket message and
+// its reply. The response type, protocol error code, room ID, error message,
+// and close code are extracted via reflection so this stays decoupled from the
+// concrete protocol response structs. The error message is logged as the
+// rejection reason so operators can see why a message was rejected without
+// correlating against the wire response.
+func (s *Server) logWS(ip string, bytesIn int, env protocol.Envelope, result room.Result, duration time.Duration) {
+	if s.reqLog == nil {
+		return
+	}
+	respType, roomID, errorCode, reason := responseInfo(result.Response)
+	s.reqLog.LogWS(ip, env.Type, env.RequestID, roomID, respType, errorCode, result.CloseCode, bytesIn, duration, reason)
+}
+
+// responseInfo extracts the wire `type`, `roomId`, `errorCode`, and `message`
+// fields from a protocol response struct via reflection. All return values
+// are zero/nil/"" when resp is nil or the field is absent. The `message`
+// field is returned as the rejection reason (populated for ErrorResponse).
+func responseInfo(resp any) (responseType, roomID string, errorCode *int, reason string) {
+	if resp == nil {
+		return "", "", nil, ""
+	}
+	v := reflect.ValueOf(resp)
+	if v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			return "", "", nil, ""
+		}
+		v = v.Elem()
+	}
+	if v.Kind() != reflect.Struct {
+		return "", "", nil, ""
+	}
+	if f := v.FieldByName("Type"); f.IsValid() && f.Kind() == reflect.String {
+		responseType = f.String()
+	}
+	if f := v.FieldByName("RoomID"); f.IsValid() && f.Kind() == reflect.String {
+		roomID = f.String()
+	}
+	if f := v.FieldByName("ErrorCode"); f.IsValid() && f.Kind() == reflect.Int {
+		c := int(f.Int())
+		errorCode = &c
+	}
+	if f := v.FieldByName("Message"); f.IsValid() && f.Kind() == reflect.String {
+		reason = f.String()
+	}
+	return responseType, roomID, errorCode, reason
 }
 
 // --- WebSocket Conn implementation ---
@@ -268,6 +337,9 @@ type wsConn struct {
 	closeCh  chan struct{}
 	closeOnce sync.Once
 
+	closeMu       sync.Mutex
+	closeCode     *int    // last close code passed to Close, for request logging
+	closeReason   string  // last close reason passed to Close, for request logging
 	writeErr error // set when the writer goroutine exits
 }
 
@@ -304,12 +376,31 @@ func (c *wsConn) Send(data []byte) bool {
 // Close shuts down the connection once.
 func (c *wsConn) Close(code int, reason string) {
 	c.closeOnce.Do(func() {
+		cc := code
+		c.closeMu.Lock()
+		c.closeCode = &cc
+		c.closeReason = reason
+		c.closeMu.Unlock()
 		close(c.closeCh)
 		// Best-effort close frame; ignore errors.
 		msg := websocket.FormatCloseMessage(code, reason)
 		_ = c.conn.WriteControl(websocket.CloseMessage, msg, time.Now().Add(time.Second))
 		_ = c.conn.Close()
 	})
+}
+
+// CloseCode returns the close code passed to the first Close call, if any.
+func (c *wsConn) CloseCode() *int {
+	c.closeMu.Lock()
+	defer c.closeMu.Unlock()
+	return c.closeCode
+}
+
+// CloseReason returns the close reason passed to the first Close call, if any.
+func (c *wsConn) CloseReason() string {
+	c.closeMu.Lock()
+	defer c.closeMu.Unlock()
+	return c.closeReason
 }
 
 func (c *wsConn) IP() string { return c.ip }
@@ -331,6 +422,13 @@ func (c *wsConn) runReadLoop(s *Server, sess *room.Session) {
 		s.registry.DecConnections()
 		s.metrics.ConnectionsLive.Dec()
 		c.Close(int(protocol.CloseProtocolError), "read loop exit")
+		// Emit a final ws log entry capturing the close code and reason so
+		// operators can see why each connection ended — including closes
+		// initiated by the registry (e.g. close-room → 4013) that bypass
+		// the per-message Result.CloseCode path.
+		if s.reqLog != nil {
+			s.reqLog.LogWS(c.ip, "close", "", "", "", nil, c.CloseCode(), 0, 0, c.CloseReason())
+		}
 	}()
 
 	handshakeDone := false
@@ -341,19 +439,27 @@ func (c *wsConn) runReadLoop(s *Server, sess *room.Session) {
 			// Handshake timeout surfaces as a read deadline error.
 			if !handshakeDone && isTimeout(err) {
 				_ = c.sendError(protocol.ErrHandshakeTimeout, "handshake timeout", "")
+				c.Close(int(protocol.CloseProtocolError), "handshake timeout")
+			} else if isCloseError(err) {
+				// Client-initiated close or network error; record the
+				// reason for the final close log entry.
+				c.Close(int(protocol.CloseProtocolError), "client disconnected: "+err.Error())
+			} else {
+				c.Close(int(protocol.CloseProtocolError), "read error: "+err.Error())
 			}
 			return
 		}
 		if op == websocket.BinaryMessage {
 			// Binary frames are a protocol error.
 			_ = c.sendError(protocol.ErrMalformedMessage, "binary frames not allowed", "")
-			c.Close(int(protocol.CloseProtocolError), "binary frame")
+			c.Close(int(protocol.CloseProtocolError), "binary frame rejected")
 			return
 		}
 		// Reset the read deadline to the ping-based keepalive once attached.
 		// Before the handshake, the deadline stays at the handshake timeout.
 
-		result := s.dispatch(sess, c, raw)
+		msgStart := time.Now()
+		env, result := s.dispatch(sess, c, raw)
 		if result.Response != nil {
 			body, mErr := json.Marshal(result.Response)
 			if mErr == nil {
@@ -363,6 +469,7 @@ func (c *wsConn) runReadLoop(s *Server, sess *room.Session) {
 				s.metrics.RecordError(int(errResp.ErrorCode))
 			}
 		}
+		s.logWS(c.ip, len(raw), env, result, time.Since(msgStart))
 		if result.CloseCode != nil {
 			c.Close(*result.CloseCode, "policy")
 			return
@@ -412,4 +519,14 @@ func isTimeout(err error) bool {
 		return ne.Timeout()
 	}
 	return false
+}
+
+// isCloseError reports whether err is a gorilla/websocket close error (i.e.
+// the peer sent a close frame or the connection was cleanly closed).
+func isCloseError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ce *websocket.CloseError
+	return errors.As(err, &ce)
 }

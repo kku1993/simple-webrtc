@@ -17,6 +17,7 @@ import (
 
 	"github.com/kku1993/simple-peer-signal-server/internal/config"
 	"github.com/kku1993/simple-peer-signal-server/internal/metrics"
+	"github.com/kku1993/simple-peer-signal-server/internal/requestlog"
 	"github.com/kku1993/simple-peer-signal-server/internal/room"
 	"github.com/kku1993/simple-peer-signal-server/internal/server"
 	"github.com/kku1993/simple-peer-signal-server/internal/token"
@@ -69,7 +70,7 @@ func run() error {
 		ts = turnstile.New(cfg.TurnstileSecretKey)
 	}
 
-	srv := server.New(cfg, reg, m, ts)
+	srv := server.New(cfg, reg, m, ts, requestlog.New(os.Stdout))
 
 	// Graceful shutdown on SIGINT/SIGTERM.
 	sigCh := make(chan os.Signal, 1)
