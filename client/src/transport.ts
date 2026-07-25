@@ -3,8 +3,7 @@ import { isPlainObject } from './util.js';
 
 /**
  * The minimal slice of a `WebSocket` the transport relies on. Defining it
- * locally keeps the transport testable with a stub and avoids importing the
- * (optional, Node-only) `ws` types in browser bundles.
+ * locally keeps the transport testable with a stub.
  */
 export interface WebSocketLike {
   readonly readyState: number;
@@ -22,19 +21,12 @@ export interface WebSocketLike {
 
 export type WebSocketFactory = (url: string) => WebSocketLike;
 
-/** Resolve a WebSocket constructor that works in browser and Node. */
+/** Resolve the global `WebSocket` constructor (browsers and Node >= 22). */
 function resolveWebSocketCtor(): new (url: string) => WebSocketLike {
-  const g = globalThis as { WebSocket?: new (url: string) => WebSocketLike };
-  if (g.WebSocket) {
-    return g.WebSocket;
-  }
-  // Node fallback (optional `ws` peer dependency).
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const ws = require('ws') as { default?: new (url: string) => WebSocketLike; WebSocket?: new (url: string) => WebSocketLike };
-  const Ctor = ws.WebSocket ?? ws.default;
+  const Ctor = (globalThis as { WebSocket?: new (url: string) => WebSocketLike }).WebSocket;
   if (!Ctor) {
     throw new Error(
-      'No WebSocket implementation found. Install the `ws` package or run in a browser.',
+      'No global `WebSocket` constructor found. Run in a browser or Node >= 22.',
     );
   }
   return Ctor;

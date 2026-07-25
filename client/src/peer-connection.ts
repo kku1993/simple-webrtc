@@ -426,7 +426,7 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
   }
 
   private transportOpen(): boolean {
-    // readyState 1 = OPEN in both browser WebSocket and `ws`.
+    // readyState 1 = OPEN for the standard WebSocket interface.
     return (this.transport as unknown as { socket?: WebSocketLike }).socket?.readyState === 1;
   }
 

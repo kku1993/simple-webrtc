@@ -54,8 +54,8 @@ that speaks the protocol in `docs/DESIGN.md` against the Go server above. See
   renegotiation frame.
 - `client/src/peer-connection.ts` — `PeerConnection`, the public wrapper that
   ties `simple-peer` to the protocol state machine.
-- `client/src/transport.ts` — WebSocket wrapper (browser native + optional
-  Node `ws`).
+- `client/src/transport.ts` — WebSocket wrapper (global `WebSocket`,
+  browsers + Node >= 22).
 - `client/src/storage.ts` — `sessionStorage` persistence of
   `{ roomId, role, rejoinToken, hostEpoch, guestEpoch }`.
 - `client/src/errors.ts` — `SignalingError` mapping `error-response` and close

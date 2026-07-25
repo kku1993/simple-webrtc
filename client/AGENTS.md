@@ -23,7 +23,8 @@ TypeScript client wrapping `simple-peer` that speaks the signaling protocol in
 - Imports use the NodeNext `.js` extension convention.
 - `simple-peer` is a CJS `export =` module; imported as
   `import SimplePeer from 'simple-peer'` (esModuleInterop).
-- `ws` is an optional peer dependency (Node only); browsers use native `WebSocket`.
+- The client uses the global `WebSocket` (browsers and Node >= 22); no `ws`
+  dependency is required.
 
 ## Architecture
 

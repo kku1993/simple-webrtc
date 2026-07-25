@@ -95,8 +95,8 @@ Notes:
   fresh epoch, rebuilding the `SimplePeer` only when the peer's epoch changed.
   Persisted `BrowserSessionStore` state lets `peer.rejoin(session)` resume
   after a page reload.
-- For Node usage, install the optional `ws` peer dependency; browsers use the
-  native `WebSocket`.
+- The client uses the global `WebSocket` (browsers and Node >= 22); no
+  `ws` dependency is required.
 
 ## Repository layout
 

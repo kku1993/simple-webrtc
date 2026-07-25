@@ -34,16 +34,8 @@
     "typescript-eslint": "8.64.0",
     "tsx": "4.23.1"
   },
-  "peerDependencies": {
-    "ws": "^8.0.0"
-  },
-  "peerDependenciesMeta": {
-    "ws": {
-      "optional": true
-    }
-  },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "allowScripts": {
     "esbuild@0.28.1": true
