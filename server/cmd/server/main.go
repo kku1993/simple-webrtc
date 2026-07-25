@@ -7,6 +7,8 @@ package main
 
 import (
 	"context"
+	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -24,6 +26,16 @@ import (
 )
 
 func main() {
+	// --version prints the stamped version and exits. Handled before any other
+	// startup work so it works without SERVER_SECRET/ALLOWED_ORIGINS set.
+	showVersion := flag.Bool("version", false, "print version and exit")
+	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(version.Version)
+		os.Exit(0)
+	}
+
 	if err := run(); err != nil {
 		log.Fatalf("fatal: %v", err)
 	}
@@ -34,6 +46,8 @@ func run() error {
 	if err != nil {
 		return err
 	}
+
+	log.Printf("simple-peer-signal-server %s starting on %s", version.Version, cfg.ListenAddr)
 
 	if cfg.OriginsCheckDisabled() {
 		log.Printf("WARNING: ALLOWED_ORIGINS is \"*\"; origin checking is disabled")
