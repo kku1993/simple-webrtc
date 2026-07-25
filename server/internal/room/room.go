@@ -1,0 +1,275 @@
+// Package room implements the in-memory room registry, slot state machine,
+// signal buffering, epoch tracking, and lifecycle timers described in
+// docs/DESIGN.md.
+//
+// The package is transport-agnostic: it talks to the network through the Conn
+// interface. The WebSocket server (internal/server) supplies Conn
+// implementations.
+package room
+
+import (
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/kku1993/simple-peer-signal-server/internal/config"
+	"github.com/kku1993/simple-peer-signal-server/internal/metrics"
+	"github.com/kku1993/simple-peer-signal-server/internal/protocol"
+	"github.com/kku1993/simple-peer-signal-server/internal/ratelimit"
+	"github.com/kku1993/simple-peer-signal-server/internal/tombstone"
+	"github.com/kku1993/simple-peer-signal-server/internal/token"
+)
+
+// Conn is the network abstraction a room uses to talk to a client. The server
+// layer supplies implementations backed by a WebSocket.
+//
+// Send delivers a complete JSON-encoded message. It must be non-blocking; if
+// the underlying connection is slow or closed, Send returns false and the
+// caller treats that as a write failure (the connection will be reaped by its
+// own writer goroutine).
+//
+// Close terminates the underlying connection with the given WebSocket close
+// code and human-readable reason.
+//
+// IP returns the resolved client IP used for rate-limiting and the per-IP room
+// counter.
+type Conn interface {
+	Send(data []byte) bool
+	Close(code int, reason string)
+	IP() string
+}
+
+// MaxRoomIDLen caps inbound roomId values before any map lookup, per the design
+// doc's payload limits.
+const MaxRoomIDLen = 64
+
+// MaxEpochLen caps inbound epoch values.
+const MaxEpochLen = 64
+
+// Session is the per-connection state owned by the room registry. The server
+// creates one Session per WebSocket and passes it to each handler.
+type Session struct {
+	conn Conn
+
+	mu       sync.Mutex
+	room     *Room
+	role     protocol.Role
+	attached bool
+}
+
+// NewSession constructs a Session for the given Conn.
+func NewSession(c Conn) *Session {
+	return &Session{conn: c}
+}
+
+// Conn returns the underlying Conn.
+func (s *Session) Conn() Conn { return s.conn }
+
+// bufferedSignal is one signal held in a slot's buffer, destined for that slot.
+type bufferedSignal struct {
+	Seq        int
+	FromRole   protocol.Role
+	FromEpoch  string
+	Data       string
+	ReceivedAt time.Time
+}
+
+// Slot is one half of a room. See docs/DESIGN.md §"In-memory data model".
+type Slot struct {
+	conn              Conn
+	epoch             string // empty == never occupied in this room instance
+	reportedConnected bool
+	lastSeq           int
+	buffer            []bufferedSignal
+	bufferBytes       int
+	overflowReset     bool // marked when buffer overflowed; peer must reset
+}
+
+// Room is a pairing of two clients. See docs/DESIGN.md §"In-memory data model".
+type Room struct {
+	reg *Registry
+
+	mu                  sync.Mutex
+	roomID              string
+	createdAt           time.Time
+	instantiatedAt      time.Time
+	expiresAt           time.Time
+	peerDeadlineAt      *time.Time
+	releaseAt           *time.Time // set when both slots reported connected
+	guestPasswordHash   []byte
+	guestPasswordSalt   []byte
+	passwordAttempts    int
+	ownerIP             string
+	slots               map[protocol.Role]*Slot
+}
+
+// Registry holds all live rooms and the supporting stores.
+type Registry struct {
+	cfg          config.Config
+	signer       *token.Signer
+	tomb         *tombstone.Store
+	metrics      *metrics.Metrics
+	roomsPerIP   *ratelimit.CounterMap
+	createLimiter *ratelimit.Map
+	handshakeLimiter *ratelimit.Map
+
+	mu    sync.Mutex
+	rooms map[string]*Room
+
+	roomsGlobal       atomic.Int64
+	connectionsGlobal atomic.Int64
+
+	nowFunc func() time.Time
+	stopCh  chan struct{}
+}
+
+// New constructs a Registry. The signer, tombstone store, and metrics must be
+// non-nil; the rate limiters are constructed from the config.
+func New(cfg config.Config, signer *token.Signer, tomb *tombstone.Store, m *metrics.Metrics) *Registry {
+	r := &Registry{
+		cfg:    cfg,
+		signer: signer,
+		tomb:   tomb,
+		metrics: m,
+		rooms:  make(map[string]*Room),
+		nowFunc: time.Now,
+		stopCh: make(chan struct{}),
+	}
+	// Per-IP room counter: bounded LRU, max = maxRoomsPerIp.
+	r.roomsPerIP = ratelimit.NewCounterMap(100000, cfg.MaxRoomsPerIp, nil)
+	// create-room + recreating rejoins: 5/min, burst 10 → rate 5/60, burst 10.
+	r.createLimiter = ratelimit.NewMap(100000, 5.0/60.0, 10)
+	// WebSocket handshakes: 10/min, burst 20.
+	r.handshakeLimiter = ratelimit.NewMap(100000, 10.0/60.0, 20)
+	return r
+}
+
+// SetClock installs a custom clock, primarily for tests.
+func (r *Registry) SetClock(now func() time.Time) { r.nowFunc = now }
+
+// IncConnections increments the global connection counter. Returns false if the
+// cap has been reached.
+func (r *Registry) IncConnections() bool {
+	for {
+		cur := r.connectionsGlobal.Load()
+		if cur >= int64(r.cfg.MaxConnectionsGlobal) {
+			return false
+		}
+		if r.connectionsGlobal.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
+}
+
+// DecConnections decrements the global connection counter.
+func (r *Registry) DecConnections() {
+	r.connectionsGlobal.Add(-1)
+}
+
+// AllowHandshake checks the per-IP handshake rate limit. It returns whether the
+// handshake is allowed and, if not, a retryAfter duration.
+func (r *Registry) AllowHandshake(ip string) (bool, time.Duration) {
+	return r.handshakeLimiter.Allow(ip)
+}
+
+// RoomsGlobal returns the current live room count.
+func (r *Registry) RoomsGlobal() int64 { return r.roomsGlobal.Load() }
+
+// ConnectionsGlobal returns the current connection count.
+func (r *Registry) ConnectionsGlobal() int64 { return r.connectionsGlobal.Load() }
+
+// --- helpers ---
+
+func (r *Registry) now() time.Time { return r.nowFunc() }
+
+// generateRoomID produces a collision-checked roomId. The character set is
+// [0-9a-f] (hex of 16 random bytes = 32 chars, 128 bits), which is a subset of
+// the allowed [0-9a-z_-]. Collisions with live rooms and live tombstones are
+// retried.
+func (r *Registry) generateRoomID() (string, error) {
+	for i := 0; i < 8; i++ {
+		b := make([]byte, 16)
+		if _, err := rand.Read(b); err != nil {
+			return "", fmt.Errorf("rand: %w", err)
+		}
+		id := hex.EncodeToString(b) // 32 chars, [0-9a-f]
+		r.mu.Lock()
+		_, inRooms := r.rooms[id]
+		r.mu.Unlock()
+		if inRooms {
+			continue
+		}
+		if r.tomb.Has(id) {
+			continue
+		}
+		return id, nil
+	}
+	return "", errors.New("could not generate unique room id after 8 attempts")
+}
+
+// hashPassword computes sha256(salt || password) and returns the base64-encoded
+// hash and the base64-encoded salt.
+func hashPassword(salt []byte, password string) (string, string) {
+	h := sha256.New()
+	h.Write(salt)
+	h.Write([]byte(password))
+	return base64.StdEncoding.EncodeToString(h.Sum(nil)), base64.StdEncoding.EncodeToString(salt)
+}
+
+// verifyPassword compares the supplied password against the stored hash in
+// constant time.
+func verifyPassword(salt []byte, storedHash []byte, password string) bool {
+	h := sha256.New()
+	h.Write(salt)
+	h.Write([]byte(password))
+	got := h.Sum(nil)
+	return subtle.ConstantTimeCompare(got, storedHash) == 1
+}
+
+// genSalt returns 16 random bytes for the password salt.
+func genSalt() []byte {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return b
+}
+
+// send marshals msg and sends it to conn, returning whether the send succeeded.
+func send(conn Conn, msg any) bool {
+	if conn == nil {
+		return false
+	}
+	body, err := json.Marshal(msg)
+	if err != nil {
+		return false
+	}
+	return conn.Send(body)
+}
+
+// isoTime formats t as an ISO 8601 UTC string.
+func isoTime(t time.Time) string { return t.UTC().Format(time.RFC3339) }
+
+// secondsUntil returns the whole seconds between now and t, floored at 0.
+func secondsUntil(now, t time.Time) int {
+	d := t.Sub(now)
+	if d < 0 {
+		return 0
+	}
+	return int(d.Seconds())
+}
+
+// ptrStr returns a pointer to s, or nil if s is the empty string. Used for the
+// `*string` epoch fields that are nil when a slot has never been occupied.
+func ptrStr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
