@@ -8,17 +8,31 @@ reference. This README covers getting both sides running end-to-end.
 
 ## Quickstart
 
+Both the server binary and the client library are distributed as artifacts
+attached to [GitHub releases](https://github.com/kku1993/simple-peer-signal/releases),
+tagged after the repo-root `VERSION` file (e.g. `v0.1.0`).
+
 ### 1. Run the signaling server
+
+Download the prebuilt binary for your architecture from the latest release
+(`x86_64` for linux/amd64, `arm64` for linux/arm64):
+
+```sh
+VERSION=0.1.0
+ARCH=x86_64   # or arm64
+curl -L -o simple-peer-signal-server \
+  https://github.com/kku1993/simple-peer-signal/releases/download/v${VERSION}/simple-peer-signal-server-${VERSION}-${ARCH}
+chmod +x simple-peer-signal-server
+```
 
 The server requires a `SERVER_SECRET` (>=32 bytes) and an `ALLOWED_ORIGINS`
 allowlist; it refuses to start without them.
 
 ```sh
-cd server
-go run ./cmd/server \
-  SERVER_SECRET="$(openssl rand -base64 32)" \
-  ALLOWED_ORIGINS="http://localhost:5173,https://your.app" \
-  LISTEN_ADDR=":8080"
+SERVER_SECRET="$(openssl rand -base64 32)" \
+ALLOWED_ORIGINS="http://localhost:5173,https://your.app" \
+LISTEN_ADDR=":8080" \
+./simple-peer-signal-server
 ```
 
 Health and Prometheus metrics are served alongside the WebSocket endpoint:
@@ -32,45 +46,18 @@ warning; do not do this in production). See `docs/DESIGN.md`
 §"Configuration reference" for the full env var list (rate limits, room TTL,
 peer deadline, Cloudflare Turnstile, etc.).
 
-### 2. Build the client
+### 2. Set up the client
+
+The client ships as the `@simple-peer-signal/client` npm package, distributed
+as a tarball attached to the same GitHub release. Install it in your project:
 
 ```sh
-cd client
-npm install
-npm install-scripts approve esbuild   # one-off: unblock tsx's postinstall
-npm run build                         # emits ESM + .d.ts to dist/
+npm install https://github.com/kku1993/simple-peer-signal/releases/download/v0.1.0/simple-peer-signal-client-0.1.0.tgz
 ```
 
-`npm test` runs the state-machine suite against a fake WebSocket + fake
-`simple-peer`, so no browser or `wrtc` is needed.
-
-### 3. Use the client
-
-The client ships as the `@simple-peer-signal/client` package; one
-`PeerConnection` represents one room pairing. The host creates a room, the
-guest joins it, and the client handles signaling, reconnection, and
+One `PeerConnection` represents one room pairing. The host creates a room,
+the guest joins it, and the client handles signaling, reconnection, and
 renegotiation automatically.
-
-#### Installing from a GitHub release
-
-The client is distributed as a tarball attached to GitHub releases (tagged
-after the repo-root `VERSION` file, e.g. `v0.1.0`). Install it in your project
-with:
-
-```sh
-npm install https://github.com/cognition/simple-peer-signal-server/releases/download/v0.1.0/simple-peer-signal-client-0.1.0.tgz
-```
-
-See the [releases page](https://github.com/cognition/simple-peer-signal-server/releases)
-for available versions. To build a release tarball, run:
-
-```sh
-scripts/release-client.sh             # builds + packs to dist/
-```
-
-The script reads the version from the repo-root `VERSION` file and writes
-`dist/simple-peer-signal-client-<version>.tgz`. Attach the tarball to a
-GitHub release manually.
 
 ```ts
 import { PeerConnection, BrowserSessionStore } from "@simple-peer-signal/client";
@@ -118,3 +105,50 @@ Notes:
 - `package.json` — root package face for `@simple-peer-signal/client` (installed via GitHub release tarballs).
 - `scripts/` — `build.sh` (Go server binary), `release-client.sh` (client release tarball).
 - `docs/DESIGN.md` — protocol, state machine, and configuration reference.
+
+## Building from source
+
+Prebuilt artifacts are published on the
+[releases page](https://github.com/kku1993/simple-peer-signal/releases).
+The instructions below are only needed for local development or cutting a new
+release.
+
+### Server (Go)
+
+```sh
+cd server
+go run ./cmd/server \
+  SERVER_SECRET="$(openssl rand -base64 32)" \
+  ALLOWED_ORIGINS="http://localhost:5173,https://your.app" \
+  LISTEN_ADDR=":8080"
+```
+
+To build a static binary for a specific architecture (version read from the
+repo-root `VERSION` file):
+
+```sh
+scripts/build.sh              # current host arch
+scripts/build.sh x86_64       # linux/amd64
+scripts/build.sh arm64        # linux/arm64
+```
+
+### Client (TypeScript)
+
+```sh
+cd client
+npm install
+npm install-scripts approve esbuild   # one-off: unblock tsx's postinstall
+npm run build                         # emits ESM + .d.ts to dist/
+```
+
+`npm test` runs the state-machine suite against a fake WebSocket + fake
+`simple-peer`, so no browser or `wrtc` is needed.
+
+To build a release tarball (version read from the repo-root `VERSION` file,
+written to `dist/simple-peer-signal-client-<version>.tgz`):
+
+```sh
+scripts/release-client.sh             # build + pack to dist/
+```
+
+Attach the resulting tarball to a GitHub release manually.
