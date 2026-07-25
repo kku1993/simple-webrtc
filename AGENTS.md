@@ -1,6 +1,7 @@
-# simple-peer-signal-server
+# simple-peer-signal
 
-Go implementation of the signaling server in `docs/DESIGN.md`.
+Go implementation of the signaling server and typescript implementation of the
+client in `docs/DESIGN.md`.
 
 ## Layout
 
