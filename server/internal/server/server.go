@@ -28,9 +28,14 @@ import (
 )
 
 // upgrader is configured per-connection because the read limit depends on cfg.
+// CheckOrigin is disabled here because origin authorization is enforced
+// explicitly in handleSignal via cfg.OriginAllowed before the upgrade; relying
+// on gorilla's default would reject legitimate cross-origin requests even when
+// ALLOWED_ORIGINS permits them (including "*").
 var defaultUpgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
+	CheckOrigin:     func(*http.Request) bool { return true },
 }
 
 // Server is the HTTP/WebSocket server.
