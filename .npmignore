@@ -1,0 +1,5 @@
+# Override .gitignore for `npm pack`: the root .gitignore excludes dist/,
+# but the release tarball must include the built client output. With this
+# file present, npm uses .npmignore instead of .gitignore; the `files`
+# whitelist in package.json then restricts the tarball to client/dist.
+!client/dist/

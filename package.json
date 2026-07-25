@@ -1,0 +1,38 @@
+{
+  "name": "@simple-peer-signal/client",
+  "version": "0.1.0",
+  "description": "TypeScript client wrapping simple-peer that speaks the signaling protocol described in docs/DESIGN.md",
+  "license": "MIT",
+  "type": "module",
+  "main": "./client/dist/index.js",
+  "types": "./client/dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./client/dist/index.d.ts",
+      "import": "./client/dist/index.js"
+    }
+  },
+  "files": [
+    "client/dist"
+  ],
+  "scripts": {
+    "build": "cd client && npm run build",
+    "typecheck": "cd client && npm run typecheck",
+    "lint": "cd client && npm run lint",
+    "test": "cd client && npm test"
+  },
+  "dependencies": {
+    "simple-peer": "9.11.1"
+  },
+  "peerDependencies": {
+    "ws": "^8.0.0"
+  },
+  "peerDependenciesMeta": {
+    "ws": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

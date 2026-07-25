@@ -46,12 +46,32 @@ npm run build                         # emits ESM + .d.ts to dist/
 
 ### 3. Use the client
 
-The client ships as the `peer-client` package; one `PeerConnection`
-represents one room pairing. The host creates a room, the guest joins it, and
-the client handles signaling, reconnection, and renegotiation automatically.
+The client ships as the `@simple-peer-signal/client` package; one
+`PeerConnection` represents one room pairing. The host creates a room, the
+guest joins it, and the client handles signaling, reconnection, and
+renegotiation automatically.
+
+#### Installing from a GitHub release
+
+The client is distributed as a tarball attached to GitHub releases (tagged
+after `server/VERSION`, e.g. `v0.1`). Install it in your project with:
+
+```sh
+npm install https://github.com/cognition/simple-peer-signal-server/releases/download/v0.1/simple-peer-signal-client-0.1.0.tgz
+```
+
+See the [releases page](https://github.com/cognition/simple-peer-signal-server/releases)
+for available versions. To cut a new release, run:
+
+```sh
+scripts/release-client.sh             # builds, packs, creates the GitHub release
+scripts/release-client.sh --dry-run   # build + pack only, no release
+```
+
+The script reads the version from `server/VERSION` and requires the `gh` CLI.
 
 ```ts
-import { PeerConnection, BrowserSessionStore } from "peer-client";
+import { PeerConnection, BrowserSessionStore } from "@simple-peer-signal/client";
 
 // Host side
 const host = new PeerConnection({
@@ -92,5 +112,7 @@ Notes:
 ## Repository layout
 
 - `server/` — Go signaling server (`cmd/server` entry point, `internal/*` packages).
-- `client/` — TypeScript `peer-client` package wrapping `simple-peer`.
+- `client/` — TypeScript source for `@simple-peer-signal/client` (wrapping `simple-peer`).
+- `package.json` — root package face for `@simple-peer-signal/client` (installed via GitHub release tarballs).
+- `scripts/` — `build.sh` (Go server binary), `release-client.sh` (client release tarball).
 - `docs/DESIGN.md` — protocol, state machine, and configuration reference.
