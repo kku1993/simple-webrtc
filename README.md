@@ -54,21 +54,23 @@ renegotiation automatically.
 #### Installing from a GitHub release
 
 The client is distributed as a tarball attached to GitHub releases (tagged
-after `server/VERSION`, e.g. `v0.1`). Install it in your project with:
+after the repo-root `VERSION` file, e.g. `v0.1.0`). Install it in your project
+with:
 
 ```sh
-npm install https://github.com/cognition/simple-peer-signal-server/releases/download/v0.1/simple-peer-signal-client-0.1.0.tgz
+npm install https://github.com/cognition/simple-peer-signal-server/releases/download/v0.1.0/simple-peer-signal-client-0.1.0.tgz
 ```
 
 See the [releases page](https://github.com/cognition/simple-peer-signal-server/releases)
-for available versions. To cut a new release, run:
+for available versions. To build a release tarball, run:
 
 ```sh
-scripts/release-client.sh             # builds, packs, creates the GitHub release
-scripts/release-client.sh --dry-run   # build + pack only, no release
+scripts/release-client.sh             # builds + packs to dist/
 ```
 
-The script reads the version from `server/VERSION` and requires the `gh` CLI.
+The script reads the version from the repo-root `VERSION` file and writes
+`dist/simple-peer-signal-client-<version>.tgz`. Attach the tarball to a
+GitHub release manually.
 
 ```ts
 import { PeerConnection, BrowserSessionStore } from "@simple-peer-signal/client";

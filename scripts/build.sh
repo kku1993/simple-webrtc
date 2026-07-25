@@ -7,7 +7,7 @@
 #   scripts/build.sh arm64        # cross-compile for linux/arm64
 #   scripts/build.sh --output DIR # place the binary in DIR (default: scripts/../dist)
 #
-# The version is read from server/VERSION (a single "major.minor" line) and
+# The version is read from VERSION (a single "major.minor.patch" line) and
 # stamped into the binary via -ldflags "-X ...version.Version=<v>". The binary
 # is named `simple-peer-signal-server-<version>-<arch>` (e.g. simple-peer-signal-server-0.1.0-x86_64).
 # The resulting binary is fully static (no libc dependency) because CGO is disabled.
@@ -34,9 +34,9 @@ arch        Target architecture: x86_64 (linux/amd64) or arm64 (linux/arm64).
 --output DIR
             Directory to place the binary in. Defaults to <repo>/dist.
 
-The version is read from server/VERSION. Override with VERSION=<v>:
+The version is read from the repo-root VERSION file. Override with VERSION=<v>:
 
-    VERSION=0.2 scripts/build.sh arm64
+    VERSION=0.2.0 scripts/build.sh arm64
 
 Examples:
     scripts/build.sh
@@ -100,27 +100,28 @@ if [[ ! -d "${SERVER_DIR}" ]]; then
     exit 1
 fi
 
-# Read the version from server/VERSION unless overridden via the VERSION env
-# var. The file is expected to contain a single line of the form "major.minor".
-version_file="${SERVER_DIR}/VERSION"
+# Read the version from the repo-root VERSION file unless overridden via the
+# VERSION env var. The file is expected to contain a single line of the form
+# "major.minor.patch".
+version_file="${REPO_ROOT}/VERSION"
 if [[ -n "${VERSION:-}" ]]; then
     version="${VERSION}"
 elif [[ -f "${version_file}" ]]; then
     # Strip whitespace/comments; take the first non-empty, non-# line.
     version="$(grep -E '^[[:space:]]*[^#[:space:]]' "${version_file}" | head -n1 | tr -d '[:space:]')"
     if [[ -z "${version}" ]]; then
-        echo "server/VERSION is empty; refusing to build." >&2
+        echo "VERSION is empty; refusing to build." >&2
         exit 1
     fi
 else
-    echo "server/VERSION not found at ${version_file}." >&2
+    echo "VERSION not found at ${version_file}." >&2
     echo "Set VERSION=<v> in the environment or create the file." >&2
     exit 1
 fi
 
-# Validate the version looks like major.minor (allowing optional patch/pre).
-if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+([.][0-9A-Za-z.-]+)?$ ]]; then
-    echo "Invalid version \"${version}\": expected major.minor (e.g. 0.1)." >&2
+# Validate the version looks like major.minor.patch (allowing optional pre).
+if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.][0-9A-Za-z.-]+)?$ ]]; then
+    echo "Invalid version \"${version}\": expected major.minor.patch (e.g. 0.1.0)." >&2
     exit 1
 fi
 
