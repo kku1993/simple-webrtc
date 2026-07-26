@@ -18,6 +18,8 @@ export {
   type RejoinResult,
   type PeerStatus,
   type PeerConnectionEvents,
+  type PeerDestroyedReason,
+  type MediaDiagnostics,
 } from './peer-connection.js';
 
 export {

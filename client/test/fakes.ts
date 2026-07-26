@@ -74,11 +74,35 @@ export class FakeWebSocket implements WebSocketLike {
 /**
  * A fake `simple-peer` instance. It records `signal`/`send` calls and lets
  * tests fire `signal`/`connect`/`data`/`close`/`error` events via the
- * `emit*` methods.
+ * `emit*` methods. Media methods (`addTrack`/`removeTrack`/`replaceTrack`/
+ * `addStream`/`removeStream`) record their arguments so tests can assert
+ * attachment behavior across peer generations.
  */
 export class FakePeer implements PeerLike {
   readonly signals: (string | SimplePeerSignalData)[] = [];
   readonly sent: unknown[] = [];
+  /** Recorded `addTrack(track, stream)` calls in order. */
+  readonly addTrackCalls: { track: MediaStreamTrack; stream: MediaStream }[] = [];
+  /** Recorded `removeTrack(track, stream)` calls in order. */
+  readonly removeTrackCalls: { track: MediaStreamTrack; stream: MediaStream }[] = [];
+  /** Recorded `replaceTrack(old, new, stream)` calls in order. */
+  readonly replaceTrackCalls: {
+    oldTrack: MediaStreamTrack;
+    newTrack: MediaStreamTrack;
+    stream: MediaStream;
+  }[] = [];
+  /** Recorded `addStream(stream)` calls in order. */
+  readonly addStreamCalls: { stream: MediaStream }[] = [];
+  /** Recorded `removeStream(stream)` calls in order. */
+  readonly removeStreamCalls: { stream: MediaStream }[] = [];
+  /** Optional override: when set, `addTrack` throws this error. */
+  addTrackThrows: Error | null = null;
+  /** Optional override: when set, `removeTrack` throws this error. */
+  removeTrackThrows: Error | null = null;
+  /** Optional override: when set, `replaceTrack` rejects/throws this error. */
+  replaceTrackThrows: Error | null = null;
+  /** Optional override: when set, `replaceTrack` returns this Promise. */
+  replaceTrackReturns: Promise<void> | null = null;
   connected = false;
   destroyed = false;
   readonly initiator: boolean;
@@ -99,6 +123,34 @@ export class FakePeer implements PeerLike {
   destroy(_error?: Error): unknown {
     this.destroyed = true;
     return undefined;
+  }
+
+  addTrack(track: MediaStreamTrack, stream: MediaStream): void {
+    if (this.addTrackThrows) throw this.addTrackThrows;
+    this.addTrackCalls.push({ track, stream });
+  }
+
+  removeTrack(track: MediaStreamTrack, stream: MediaStream): void {
+    if (this.removeTrackThrows) throw this.removeTrackThrows;
+    this.removeTrackCalls.push({ track, stream });
+  }
+
+  replaceTrack(
+    oldTrack: MediaStreamTrack,
+    newTrack: MediaStreamTrack,
+    stream: MediaStream,
+  ): Promise<void> | void {
+    if (this.replaceTrackThrows) throw this.replaceTrackThrows;
+    this.replaceTrackCalls.push({ oldTrack, newTrack, stream });
+    return this.replaceTrackReturns ?? undefined;
+  }
+
+  addStream(stream: MediaStream): void {
+    this.addStreamCalls.push({ stream });
+  }
+
+  removeStream(stream: MediaStream): void {
+    this.removeStreamCalls.push({ stream });
   }
 
   on(event: string, fn: Listener): this {
@@ -134,9 +186,75 @@ export class FakePeer implements PeerLike {
     this.fire('error', err);
   }
 
+  /** Fire a `stream` event to listeners. */
+  emitStream(stream: MediaStream): void {
+    this.fire('stream', stream);
+  }
+
+  /** Fire a `track` event to listeners. */
+  emitTrack(track: MediaStreamTrack, stream: MediaStream): void {
+    this.fire('track', track, stream);
+  }
+
   private fire(event: string, ...args: unknown[]): void {
     for (const h of [...(this.listeners.get(event) ?? [])]) h(...args);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Fake MediaStreamTrack / MediaStream
+//
+// Node does not expose browser media globals, so tests use minimal stubs that
+// implement just the surface the wrapper touches (`id`, `kind`, `readyState`,
+// `getTracks()`). They are typed as the real DOM types via `as unknown as`
+// casts at call sites.
+// ---------------------------------------------------------------------------
+
+export class FakeTrack {
+  readonly id: string;
+  readonly kind: string;
+  readyState: MediaStreamTrackState;
+  /** Set to true to simulate `track.enabled`. */
+  enabled = true;
+
+  constructor(opts: { id?: string; kind?: string; readyState?: MediaStreamTrackState } = {}) {
+    this.id = opts.id ?? `track-${Math.random().toString(36).slice(2, 10)}`;
+    this.kind = opts.kind ?? 'audio';
+    this.readyState = opts.readyState ?? 'live';
+  }
+
+  /** Mimic `MediaStreamTrack.stop()`. */
+  stop(): void {
+    this.readyState = 'ended';
+  }
+}
+
+export class FakeStream {
+  readonly id: string;
+  private readonly tracks: FakeTrack[] = [];
+
+  constructor(tracks: FakeTrack[] = []) {
+    this.id = `stream-${Math.random().toString(36).slice(2, 10)}`;
+    for (const t of tracks) this.tracks.push(t);
+  }
+
+  getTracks(): FakeTrack[] {
+    return [...this.tracks];
+  }
+
+  addTrack(t: FakeTrack): void {
+    this.tracks.push(t);
+  }
+}
+
+/** Cast a {@link FakeTrack} to the DOM `MediaStreamTrack` type. */
+export function asTrack(t: FakeTrack): MediaStreamTrack {
+  return t as unknown as MediaStreamTrack;
+}
+
+/** Cast a {@link FakeStream} to the DOM `MediaStream` type. */
+export function asStream(s: FakeStream): MediaStream {
+  return s as unknown as MediaStream;
 }
 
 /** Build a transportFactory and simplePeerFactory that use the fakes above. */
