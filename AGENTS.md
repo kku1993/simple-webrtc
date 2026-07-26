@@ -14,6 +14,8 @@ client in `docs/DESIGN.md`.
 - `src/internal/ratelimit/` — token buckets + per-IP counter map (both bounded LRU).
 - `src/internal/room/` — room registry, slot state machine, signal buffering,
   epochs, lifecycle timers, recreate-from-token.
+- `src/internal/roomid/` — human-friendly room ID generator
+  (`[shard]-[adjective]-[noun]-[sequence]`, e.g. `us-golden-dragon-k3`).
 - `src/internal/turnstile/` — Cloudflare Turnstile siteverify client.
 - `src/internal/metrics/` — Prometheus instruments.
 - `src/internal/requestlog/` — JSON request logging (HTTP + WebSocket).

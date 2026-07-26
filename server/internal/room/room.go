@@ -12,10 +12,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
-	"errors"
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,6 +21,7 @@ import (
 	"github.com/kku1993/simple-peer-signal-server/internal/metrics"
 	"github.com/kku1993/simple-peer-signal-server/internal/protocol"
 	"github.com/kku1993/simple-peer-signal-server/internal/ratelimit"
+	"github.com/kku1993/simple-peer-signal-server/internal/roomid"
 	"github.com/kku1993/simple-peer-signal-server/internal/tombstone"
 	"github.com/kku1993/simple-peer-signal-server/internal/token"
 )
@@ -190,29 +188,18 @@ func (r *Registry) ConnectionsGlobal() int64 { return r.connectionsGlobal.Load()
 
 func (r *Registry) now() time.Time { return r.nowFunc() }
 
-// generateRoomID produces a collision-checked roomId. The character set is
-// [0-9a-f] (hex of 16 random bytes = 32 chars, 128 bits), which is a subset of
-// the allowed [0-9a-z_-]. Collisions with live rooms and live tombstones are
-// retried.
+// generateRoomID produces a collision-checked, human-friendly roomId of the
+// form `us-<adjective>-<noun>-<seq>` (see docs/DESIGN.md §"Identifier
+// encoding / roomId" and internal/roomid). Collisions with live rooms and
+// live tombstones are retried up to roomid.MaxRetries times.
 func (r *Registry) generateRoomID() (string, error) {
-	for i := 0; i < 8; i++ {
-		b := make([]byte, 16)
-		if _, err := rand.Read(b); err != nil {
-			return "", fmt.Errorf("rand: %w", err)
-		}
-		id := hex.EncodeToString(b) // 32 chars, [0-9a-f]
+	exists := func(id string) bool {
 		r.mu.Lock()
 		_, inRooms := r.rooms[id]
 		r.mu.Unlock()
-		if inRooms {
-			continue
-		}
-		if r.tomb.Has(id) {
-			continue
-		}
-		return id, nil
+		return inRooms || r.tomb.Has(id)
 	}
-	return "", errors.New("could not generate unique room id after 8 attempts")
+	return roomid.Generate(roomid.Shard, exists)
 }
 
 // hashPassword computes sha256(salt || password) and returns the base64-encoded

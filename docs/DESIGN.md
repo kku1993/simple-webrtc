@@ -59,6 +59,35 @@ The server's only hard requirements are:
 **Collision-checked on generation.** Regenerate on the event of a collision with
 a live room or tombstone rather than assuming uniqueness.
 
+#### Generated format
+
+Room IDs minted by this server have a human-friendly, speakable form (see
+`internal/roomid`):
+
+```
+[shard]-[adjective]-[noun]-[sequence]
+```
+
+e.g. `us-golden-dragon-k3`. All parts are lowercase.
+
+- **shard** — an opaque tag assigned to the backend instance, drawn from
+  `[0-9a-z]`. For now every instance uses `us`. A future load balancer can
+  route on this prefix. The code must not assume anything beyond `[0-9a-z]`.
+- **adjective**, **noun** — drawn from curated, Chinese-culture-themed word
+  lists containing only `[a-z]` characters, with no negative or vulgar
+  connotations (copied from the `mahjong-p2p` `names` package).
+- **sequence** — a 2-digit base-36 (`0-9a-z`) suffix that widens the ID space
+  and absorbs collisions. It is capped at 2 digits to avoid randomly spelling
+  out a bad word.
+
+The whole ID uses only `[0-9a-z-]`, a subset of the protocol's allowed
+`[0-9a-z_-]`. The entropy is far below 128 bits (≈ 50 adjectives × 100 nouns ×
+1296 sequences ≈ 6.5M possibilities); uniqueness is provided by the
+collision-checked generation with up to 5 retries, **not** by entropy. This is
+an explicit trade-off of readability over unguessability: the `roomId` is not a
+secret — the signed `rejoinToken` (256-bit MAC) is the bearer credential that
+authorizes rejoining a room.
+
 On input, the server caps `roomId` at **64 characters** before doing any map
 lookup or allocation. An unknown ID is simply `ROOM_NOT_FOUND`.
 
@@ -523,9 +552,10 @@ identifies it, `role` says which slot the bearer takes, `createdAt` bounds its
 lifetime, and the password hash preserves the room's access control so a guest
 that lost its own token can still `join-room` with the password.
 
-The token is a bearer credential. It is unguessable (a 128-bit `roomId` plus a
-256-bit MAC) and scoped to one slot of one room, so leaking it is no worse than
-leaking the room invite itself.
+The token is a bearer credential. It is unguessable (a 256-bit MAC over a
+payload that includes the `roomId`) and scoped to one slot of one room, so
+leaking it is no worse than leaking the room invite itself. The `roomId` itself
+is human-friendly and not a secret (see §"roomId / Generated format").
 
 ### Verification
 
