@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/kku1993/simple-peer-signal-server/internal/protocol"
+	"github.com/kku1993/simple-peer-signal-server/internal/roomid"
 	"github.com/kku1993/simple-peer-signal-server/internal/tombstone"
 	"github.com/kku1993/simple-peer-signal-server/internal/token"
 )
@@ -173,6 +174,18 @@ func (r *Registry) JoinRoom(s *Session, m protocol.JoinRoomMsg) Result {
 	if m.RoomID == "" || len(m.RoomID) > MaxRoomIDLen {
 		return errResult(protocol.ErrMalformedMessage, "roomId required (max 64 chars)", m.RequestID, nil)
 	}
+	// Room IDs follow docs/ROOM_ID_SPEC.md: `[shard][nid]` (6 lowercase chars
+	// with Crockford base32 fuzzy decoding on input). A malformed id or one
+	// whose shard does not match this instance is rejected as malformed
+	// rather than looked up — see the spec's "Backend handling" section.
+	// Normalize to the canonical lowercase form before any map lookup so
+	// that uppercase or fuzzy-equivalent input (e.g. "TA0000", "tO0000")
+	// resolves to the same room as the canonical key ("ta0000", "t00000").
+	roomID, ok := roomid.NormalizeRoomID(m.RoomID)
+	if !ok || !roomid.IsValidRoomID(roomID, r.cfg.ShardName) {
+		return errResult(protocol.ErrMalformedMessage, "roomId malformed or wrong shard", m.RequestID, nil)
+	}
+	m.RoomID = roomID
 	if m.GuestEpoch == "" || len(m.GuestEpoch) > MaxEpochLen {
 		return errResult(protocol.ErrMalformedMessage, "guestEpoch required (max 64 chars)", m.RequestID, nil)
 	}

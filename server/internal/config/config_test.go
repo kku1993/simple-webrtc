@@ -16,6 +16,7 @@ func validBaseEnv(t *testing.T) {
 	// provide a 32+ byte string.
 	setEnv(t, "SERVER_SECRET", "0123456789abcdef0123456789abcdef0123456789abcdef")
 	setEnv(t, "ALLOWED_ORIGINS", "https://example.com,https://app.example.com")
+	setEnv(t, "SHARD_NAME", "t")
 }
 
 func TestLoadDefaults(t *testing.T) {
@@ -67,6 +68,40 @@ func TestLoadMissingOriginsFails(t *testing.T) {
 	os.Unsetenv("ALLOWED_ORIGINS")
 	if _, err := Load(); err == nil {
 		t.Fatalf("expected error for missing ALLOWED_ORIGINS")
+	}
+}
+
+func TestLoadMissingShardFails(t *testing.T) {
+	validBaseEnv(t)
+	os.Unsetenv("SHARD_NAME")
+	if _, err := Load(); err == nil {
+		t.Fatalf("expected error for missing SHARD_NAME")
+	}
+}
+
+func TestLoadInvalidShardFails(t *testing.T) {
+	validBaseEnv(t)
+	for _, shard := range []string{"us", "0", "i", "o", "l", "u", "", "ab"} {
+		t.Setenv("SHARD_NAME", shard)
+		if _, err := Load(); err == nil {
+			t.Errorf("expected error for SHARD_NAME=%q", shard)
+		}
+	}
+}
+
+func TestLoadValidShard(t *testing.T) {
+	validBaseEnv(t)
+	// Any single alphabetic Crockford base32 char (case-insensitive) is
+	// accepted. The raw value is stored; roomid normalizes case at use.
+	for _, shard := range []string{"t", "T", "z", "a"} {
+		t.Setenv("SHARD_NAME", shard)
+		c, err := Load()
+		if err != nil {
+			t.Fatalf("Load(SHARD_NAME=%q): %v", shard, err)
+		}
+		if c.ShardName != shard {
+			t.Errorf("ShardName = %q, want %q", c.ShardName, shard)
+		}
 	}
 }
 

@@ -61,35 +61,53 @@ a live room or tombstone rather than assuming uniqueness.
 
 #### Generated format
 
-Room IDs minted by this server have a human-friendly, speakable form (see
-`internal/roomid`):
+Room IDs minted by this server follow `docs/ROOM_ID_SPEC.md` (mirrored from the
+`mahjong-p2p` project). They have the form (see `internal/roomid`):
 
 ```
-[shard]-[adjective]-[noun]-[sequence]
+[shard][nid]
 ```
 
-e.g. `us-golden-dragon-k3`. All parts are lowercase.
+— 6 lowercase characters, no separators. e.g. `ta0000`.
 
-- **shard** — an opaque tag assigned to the backend instance, drawn from
-  `[0-9a-z]`. For now every instance uses `us`. A future load balancer can
-  route on this prefix. The code must not assume anything beyond `[0-9a-z]`.
-- **adjective**, **noun** — drawn from curated, Chinese-culture-themed word
-  lists containing only `[a-z]` characters, with no negative or vulgar
-  connotations (copied from the `mahjong-p2p` `names` package).
-- **sequence** — a 2-digit base-36 (`0-9a-z`) suffix that widens the ID space
-  and absorbs collisions. It is capped at 2 digits to avoid randomly spelling
-  out a bad word.
+- **shard** — a single alphabetic Crockford base32 character
+  (`[abcdefghjkmnpqrstvwxyz]`; digits `[0-9]` are reserved for future use). It
+  is assigned to the backend instance via the `SHARD_NAME` config and
+  identifies the shard so a future load balancer can route by the first
+  character. The server refuses to start without a valid `SHARD_NAME`.
+- **nid** — 5 characters: the first is a Crockford base32 digit
+  (`[0-9a-z]` excluding `i`, `l`, `o`, `u`) and the remaining four are base 10
+  (`[0-9]`). Only one base32 digit is used to avoid accidentally spelling a
+  bad word. The nid is randomly generated on room creation.
 
-The whole ID uses only `[0-9a-z-]`, a subset of the protocol's allowed
-`[0-9a-z_-]`. The entropy is far below 128 bits (≈ 50 adjectives × 100 nouns ×
-1296 sequences ≈ 6.5M possibilities); uniqueness is provided by the
+On input, Crockford base32 fuzzy decoding rules apply (`O→0`, `I→1`, `L→1`,
+case-insensitive); the canonical form is always lowercase. See
+<https://www.crockford.com/base32.html>.
+
+The whole ID uses only `[0-9a-z]`, a subset of the protocol's allowed
+`[0-9a-z_-]`. The entropy is far below 128 bits (32 first-nid digits × 10⁴
+= 320k possibilities per shard); uniqueness is provided by the
 collision-checked generation with up to 5 retries, **not** by entropy. This is
-an explicit trade-off of readability over unguessability: the `roomId` is not a
-secret — the signed `rejoinToken` (256-bit MAC) is the bearer credential that
-authorizes rejoining a room.
+an explicit trade-off of brevity/typeability over unguessability: the `roomId`
+is not a secret — the signed `rejoinToken` (256-bit MAC) is the bearer
+credential that authorizes rejoining a room.
+
+#### Input validation
 
 On input, the server caps `roomId` at **64 characters** before doing any map
-lookup or allocation. An unknown ID is simply `ROOM_NOT_FOUND`.
+lookup or allocation. Per `docs/ROOM_ID_SPEC.md` §"Backend handling", the
+server then applies Crockford base32 fuzzy decoding to normalize the id to its
+canonical lowercase form (e.g. `TA0000` → `ta0000`, `tO0000` → `t00000`) and
+rejects an id that is malformed or whose shard does not match this instance's
+`SHARD_NAME` with `MALFORMED_MESSAGE` (the protocol's analogue of a 400 Bad
+Request). All subsequent lookups (tombstone, room map) use the canonical form.
+A well-formed id belonging to this shard that simply does not exist is
+`ROOM_NOT_FOUND`.
+
+Per `docs/ROOM_ID_SPEC.md` §"Frontend handling", the client performs **no**
+validation or fuzzy decoding — it treats `roomId` as an opaque string and
+passes it through unchanged, so the schema can evolve without forcing client
+updates.
 
 ## How this maps onto simple-peer
 
@@ -555,7 +573,7 @@ that lost its own token can still `join-room` with the password.
 The token is a bearer credential. It is unguessable (a 256-bit MAC over a
 payload that includes the `roomId`) and scoped to one slot of one room, so
 leaking it is no worse than leaking the room invite itself. The `roomId` itself
-is human-friendly and not a secret (see §"roomId / Generated format").
+is short and not a secret (see §"roomId / Generated format").
 
 ### Verification
 
@@ -843,7 +861,11 @@ bill; the per-IP ones only shape abuse.
 
 - 64 KB per WebSocket frame, enforced at the frame level.
 - 256 KB total buffered signal bytes per slot.
-- Inbound `roomId` capped at 64 characters before any map lookup or allocation.
+- Inbound `roomId` capped at 64 characters before any map lookup or allocation,
+  then normalized via Crockford base32 fuzzy decoding to canonical lowercase
+  and validated against `docs/ROOM_ID_SPEC.md` (format + shard match); a
+  malformed or wrong-shard id is rejected with `MALFORMED_MESSAGE` before any
+  map lookup. All subsequent lookups use the canonical form.
 - Inbound `epoch` values capped at 64 characters.
 
 ### Bot prevention
@@ -966,10 +988,10 @@ room in total.
 Avoid platforms that price long-lived WebSockets per connection-minute. A small
 always-on VM is dramatically cheaper for this workload.
 
-If a second instance ever becomes necessary, the natural extension is to prefix
-`roomId` with an instance tag and route on it at the edge. The protocol is
-already compatible with this — `roomId` is server-assigned and opaque to
-clients — so no message format would change.
+If a second instance ever becomes necessary, the natural extension is to run
+it with a different `SHARD_NAME` and route on the first character of `roomId`
+at the edge. The protocol is already compatible with this — `roomId` is
+server-assigned and opaque to clients — so no message format would change.
 
 ### Operational endpoints
 
@@ -988,6 +1010,7 @@ the process is losing state.
 | `listenAddr` | `LISTEN_ADDR` | `:8080` | |
 | `serverSecret` | `SERVER_SECRET` | *(required)* | ≥32 bytes. **Server refuses to start without it** |
 | `allowedOrigins` | `ALLOWED_ORIGINS` | *(required)* | Comma-separated; `*` disables the check |
+| `shardName` | `SHARD_NAME` | *(required)* | Single alphabetic Crockford base32 char (`a-z` excluding `i`, `l`, `o`, `u`). Baked into every generated `roomId` for edge routing |
 | `trustedProxyCount` | `TRUSTED_PROXY_COUNT` | `0` | `X-Forwarded-For` is ignored when 0 |
 | `cloudflareMode` | `CLOUDFLARE_MODE` | `false` | Prefer `CF-Connecting-IP` |
 | `turnstileSecretKey` | `TURNSTILE_SECRET_KEY` | *(unset)* | Enables bot prevention on `create-room` |
@@ -1052,8 +1075,8 @@ concern at this scale — prefer the simple design.
 
 ## Implementation checklist
 
-1. Startup validation: fatal error if `serverSecret` or `allowedOrigins` is
-   unset.
+1. Startup validation: fatal error if `serverSecret`, `allowedOrigins`, or
+   `shardName` is unset/invalid.
 2. WebSocket endpoint with origin check, global connection cap, and handshake
    timeout.
 3. Token codec: sign, verify (constant-time), encode, decode, TTL check.

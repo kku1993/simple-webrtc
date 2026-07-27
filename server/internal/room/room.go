@@ -188,10 +188,10 @@ func (r *Registry) ConnectionsGlobal() int64 { return r.connectionsGlobal.Load()
 
 func (r *Registry) now() time.Time { return r.nowFunc() }
 
-// generateRoomID produces a collision-checked, human-friendly roomId of the
-// form `us-<adjective>-<noun>-<seq>` (see docs/DESIGN.md §"Identifier
-// encoding / roomId" and internal/roomid). Collisions with live rooms and
-// live tombstones are retried up to roomid.MaxRetries times.
+// generateRoomID produces a collision-checked room id of the form
+// `[shard][nid]` (see docs/ROOM_ID_SPEC.md and internal/roomid). Collisions
+// with live rooms and live tombstones are retried up to roomid.MaxRetries
+// times.
 func (r *Registry) generateRoomID() (string, error) {
 	exists := func(id string) bool {
 		r.mu.Lock()
@@ -199,7 +199,7 @@ func (r *Registry) generateRoomID() (string, error) {
 		r.mu.Unlock()
 		return inRooms || r.tomb.Has(id)
 	}
-	return roomid.Generate(roomid.Shard, exists)
+	return roomid.Generate(r.cfg.ShardName, exists)
 }
 
 // hashPassword computes sha256(salt || password) and returns the base64-encoded

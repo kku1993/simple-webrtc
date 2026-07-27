@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/kku1993/simple-peer-signal-server/internal/roomid"
 )
 
 // Config is the validated server configuration.
@@ -19,6 +21,7 @@ type Config struct {
 	ListenAddr                  string
 	ServerSecret                []byte
 	AllowedOrigins              []string // "*" disables the check
+	ShardName                   string   // single alphabetic Crockford base32 char
 	TrustedProxyCount           int
 	CloudflareMode              bool
 	TurnstileSecretKey          string
@@ -100,6 +103,7 @@ func Load() (Config, error) {
 	if v, ok := os.LookupEnv("ALLOWED_ORIGINS"); ok {
 		c.AllowedOrigins = parseOrigins(v)
 	}
+	get("SHARD_NAME", &c.ShardName)
 	if err := getInt("TRUSTED_PROXY_COUNT", &c.TrustedProxyCount); err != nil {
 		return Config{}, err
 	}
@@ -177,6 +181,9 @@ func (c Config) Validate() error {
 	}
 	if len(c.AllowedOrigins) == 0 {
 		return errors.New("ALLOWED_ORIGINS must be set; use \"*\" to disable origin checking")
+	}
+	if !roomid.IsValidShardName(c.ShardName) {
+		return errors.New("SHARD_NAME must be set to a single alphabetic Crockford base32 character (a-z excluding i, l, o, u)")
 	}
 	if c.MaxFrameBytes <= 0 {
 		return errors.New("MAX_FRAME_BYTES must be positive")

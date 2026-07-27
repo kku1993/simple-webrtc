@@ -2,6 +2,7 @@ package room
 
 import (
 	"encoding/json"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -87,6 +88,7 @@ func testRegistryWith(t *testing.T, mutate func(*config.Config)) (*Registry, *to
 		ListenAddr:                    ":0",
 		ServerSecret:                  []byte("0123456789abcdef0123456789abcdef0123456789abcdef"),
 		AllowedOrigins:                []string{"*"},
+		ShardName:                     "t",
 		PeerDeadlineSec:               600,
 		RoomMaxLifetimeSec:            5400,
 		RejoinTokenTtlSec:             43200,
@@ -200,13 +202,95 @@ func TestCreateRoomThenJoin(t *testing.T) {
 func TestJoinRoomNotFound(t *testing.T) {
 	r, _ := testRegistry(t)
 	gs := NewSession(newFakeConn("2.2.2.2"))
+	// Valid format + matching shard, but no such room exists.
+	res := r.JoinRoom(gs, protocol.JoinRoomMsg{
+		Type:       protocol.TypeJoinRoom,
+		RoomID:     "tz9999",
+		GuestEpoch: "ge",
+	})
+	if !isErr(res.last(), int(protocol.ErrRoomNotFound)) {
+		t.Errorf("expected ROOM_NOT_FOUND, got %v", res.Response)
+	}
+}
+
+func TestJoinRoomMalformedID(t *testing.T) {
+	r, _ := testRegistry(t)
+	gs := NewSession(newFakeConn("2.2.2.2"))
+	// Wrong length / charset — rejected before any map lookup.
 	res := r.JoinRoom(gs, protocol.JoinRoomMsg{
 		Type:       protocol.TypeJoinRoom,
 		RoomID:     "doesnotexist",
 		GuestEpoch: "ge",
 	})
-	if !isErr(res.last(), int(protocol.ErrRoomNotFound)) {
-		t.Errorf("expected ROOM_NOT_FOUND, got %v", res.Response)
+	if !isErr(res.last(), int(protocol.ErrMalformedMessage)) {
+		t.Errorf("expected MALFORMED_MESSAGE, got %v", res.Response)
+	}
+}
+
+func TestJoinRoomWrongShard(t *testing.T) {
+	r, _ := testRegistry(t)
+	gs := NewSession(newFakeConn("2.2.2.2"))
+	// Valid format but shard 'z' does not match this instance's 't'.
+	res := r.JoinRoom(gs, protocol.JoinRoomMsg{
+		Type:       protocol.TypeJoinRoom,
+		RoomID:     "zz0000",
+		GuestEpoch: "ge",
+	})
+	if !isErr(res.last(), int(protocol.ErrMalformedMessage)) {
+		t.Errorf("expected MALFORMED_MESSAGE for foreign shard, got %v", res.Response)
+	}
+}
+
+func TestJoinRoomNormalizesUppercaseAndFuzzy(t *testing.T) {
+	// Per docs/ROOM_ID_SPEC.md §"Backend handling", the backend must apply
+	// Crockford base32 fuzzy decoding and convert to canonical lowercase
+	// before lookups. A guest entering "TA0000" or "tO0000" must resolve to
+	// the same room stored under the canonical key "ta0000" / "t00000".
+	r, _ := testRegistry(t)
+	host := NewSession(newFakeConn("1.1.1.1"))
+	r.CreateRoom(host, protocol.CreateRoomMsg{Type: protocol.TypeCreateRoom, HostEpoch: "h"}, true)
+	roomID := getRoomID(t, r) // canonical lowercase, e.g. "ta0000"
+
+	// Uppercase version of the same id.
+	upper := strings.ToUpper(roomID)
+	gs := NewSession(newFakeConn("2.2.2.2"))
+	res := r.JoinRoom(gs, protocol.JoinRoomMsg{
+		Type:       protocol.TypeJoinRoom,
+		RoomID:     upper,
+		GuestEpoch: "g",
+	})
+	if isErr(mapOf(res.Response), int(protocol.ErrRoomNotFound)) {
+		t.Fatalf("uppercase %q did not find room %q: %v", upper, roomID, res.Response)
+	}
+	if isErr(mapOf(res.Response), int(protocol.ErrMalformedMessage)) {
+		t.Fatalf("uppercase %q rejected as malformed: %v", upper, res.Response)
+	}
+
+	// Crockford fuzzy equivalent: replace the first nid digit with 'O' (→0)
+	// or 'I' (→1) if the original was 0 or 1, and verify it still finds the
+	// room. We only test the fuzzy case when the nid's first digit is 0 or 1
+	// so the fuzzy mapping is reversible.
+	fuzzyID := roomID
+	if roomID[1] == '0' {
+		fuzzyID = roomID[:1] + "O" + roomID[2:]
+	} else if roomID[1] == '1' {
+		fuzzyID = roomID[:1] + "I" + roomID[2:]
+	}
+	if fuzzyID != roomID {
+		gs2 := NewSession(newFakeConn("3.3.3.3"))
+		// The first guest already took the slot, so this gets ROOM_FULL
+		// rather than ROOM_NOT_FOUND — which proves the room was found.
+		res2 := r.JoinRoom(gs2, protocol.JoinRoomMsg{
+			Type:       protocol.TypeJoinRoom,
+			RoomID:     fuzzyID,
+			GuestEpoch: "g2",
+		})
+		if isErr(mapOf(res2.Response), int(protocol.ErrRoomNotFound)) {
+			t.Fatalf("fuzzy %q did not find room %q: %v", fuzzyID, roomID, res2.Response)
+		}
+		if isErr(mapOf(res2.Response), int(protocol.ErrMalformedMessage)) {
+			t.Fatalf("fuzzy %q rejected as malformed: %v", fuzzyID, res2.Response)
+		}
 	}
 }
 

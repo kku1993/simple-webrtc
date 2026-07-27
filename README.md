@@ -25,12 +25,14 @@ curl -L -o simple-peer-signal-server \
 chmod +x simple-peer-signal-server
 ```
 
-The server requires a `SERVER_SECRET` (>=32 bytes) and an `ALLOWED_ORIGINS`
-allowlist; it refuses to start without them.
+The server requires a `SERVER_SECRET` (>=32 bytes), an `ALLOWED_ORIGINS`
+allowlist, and a `SHARD_NAME` (a single alphabetic Crockford base32 character,
+`a-z` excluding `i`, `l`, `o`, `u`); it refuses to start without them.
 
 ```sh
 SERVER_SECRET="$(openssl rand -base64 32)" \
 ALLOWED_ORIGINS="http://localhost:5173,https://your.app" \
+SHARD_NAME="t" \
 LISTEN_ADDR=":8080" \
 ./simple-peer-signal-server
 ```
@@ -385,6 +387,7 @@ cd server
 go run ./cmd/server \
   SERVER_SECRET="$(openssl rand -base64 32)" \
   ALLOWED_ORIGINS="http://localhost:5173,https://your.app" \
+  SHARD_NAME="t" \
   LISTEN_ADDR=":8080"
 ```
 

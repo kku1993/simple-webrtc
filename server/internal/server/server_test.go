@@ -45,6 +45,7 @@ func testConfig() config.Config {
 		ListenAddr:                    ":0",
 		ServerSecret:                  []byte("0123456789abcdef0123456789abcdef0123456789abcdef"),
 		AllowedOrigins:                []string{"*"},
+		ShardName:                     "t",
 		PeerDeadlineSec:               600,
 		RoomMaxLifetimeSec:            5400,
 		RejoinTokenTtlSec:             43200,

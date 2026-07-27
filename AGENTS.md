@@ -14,8 +14,9 @@ client in `docs/DESIGN.md`.
 - `src/internal/ratelimit/` — token buckets + per-IP counter map (both bounded LRU).
 - `src/internal/room/` — room registry, slot state machine, signal buffering,
   epochs, lifecycle timers, recreate-from-token.
-- `src/internal/roomid/` — human-friendly room ID generator
-  (`[shard]-[adjective]-[noun]-[sequence]`, e.g. `us-golden-dragon-k3`).
+- `src/internal/roomid/` — room ID generator + validator following
+  `docs/ROOM_ID_SPEC.md` (`[shard][nid]`, e.g. `ta0000`; Crockford base32
+  fuzzy decoding on input).
 - `src/internal/turnstile/` — Cloudflare Turnstile siteverify client.
 - `src/internal/metrics/` — Prometheus instruments.
 - `src/internal/requestlog/` — JSON request logging (HTTP + WebSocket).
@@ -37,13 +38,17 @@ go test -race ./...      # with the race detector
 ```sh
 SERVER_SECRET="$(openssl rand -base64 32)" \
 ALLOWED_ORIGINS="https://your.app" \
+SHARD_NAME="t" \
 LISTEN_ADDR=":8080" \
 go run ./cmd/server
 ```
 
-`SERVER_SECRET` (>=32 bytes) and `ALLOWED_ORIGINS` are required; the server
-refuses to start without them. Use `*` to disable origin checking (logs a
-warning). See `docs/DESIGN.md` §"Configuration reference" for the full list.
+`SERVER_SECRET` (>=32 bytes), `ALLOWED_ORIGINS`, and `SHARD_NAME` are required;
+the server refuses to start without them. `SHARD_NAME` is a single alphabetic
+Crockford base32 character (`a-z` excluding `i`, `l`, `o`, `u`) baked into
+every generated room id. Use `*` for `ALLOWED_ORIGINS` to disable origin
+checking (logs a warning). See `docs/DESIGN.md` §"Configuration reference" for
+the full list.
 
 ## Client (`client/`)
 
