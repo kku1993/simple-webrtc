@@ -75,6 +75,8 @@ than depending on `simple-peer` — see `docs/RTC_ENGINE_PLAN.md`. Full notes in
   full-jitter backoff.
 - `client/src/emitter.ts` — minimal typed event emitter (no `events` dep).
 - `client/src/logger.ts` — the shared `Logger` interface.
+- `client/src/roomid.ts` — frontend room id normalization (Crockford base32
+  fuzzy decoding, no validation; backend owns rejection).
 - `client/src/index.ts` — public barrel.
 - `client/test/` — `node:test` suite. `fakes.ts` provides a fake WebSocket and a
   fake peer for protocol tests; `rtc-fakes.ts` provides a fake
@@ -90,7 +92,7 @@ npm install-scripts approve esbuild   # one-off: unblock tsx's postinstall
 npm run build       # tsc -p tsconfig.build.json  -> dist/
 npm run typecheck   # tsc -p tsconfig.json --noEmit (src + test)
 npm run lint        # eslint .  (flat config, type-checked)
-npm test            # node --test --import tsx test/*.test.ts (158 tests)
+npm test            # node --test --import tsx test/*.test.ts (168 tests)
 ```
 
 The client has **no runtime dependencies**. Keep it that way.
@@ -115,7 +117,10 @@ The client has **no runtime dependencies**. Keep it that way.
 ### Protocol behaviors implemented
 
 - `createRoom` (host) / `joinRoom` (guest) / `rejoin` (recovery from a
-  persisted session).
+  persisted session). `joinRoom` normalizes the user-entered room id via
+  Crockford base32 fuzzy decoding (case-insensitive, `O→0`, `I→1`, `L→1`)
+  without rejecting malformed ids — the backend owns validation per
+  `docs/ROOM_ID_SPEC.md` §"Frontend handling".
 - Host waits for `guest-joined` before building the initiator peer; guest
   builds the non-initiator peer immediately on join.
 - `signal` ↔ `signal-response` relay with per-(slot,epoch) `seq`.

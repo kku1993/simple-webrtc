@@ -15,6 +15,7 @@ import type { Logger } from './logger.js';
 import { type RoomSession, type SessionStore, RoomSessionStore, MemorySessionStore } from './storage.js';
 import { Transport, type WebSocketFactory, type WebSocketLike } from './transport.js';
 import { SequenceCounter, generateEpoch, generateRequestId, fullJitterBackoff } from './util.js';
+import { normalizeRoomId } from './roomid.js';
 import { RtcPeer } from './rtc/peer.js';
 import { DataChannelHandle } from './rtc/channel-handle.js';
 import { assertUsableLabel, resolveSpec } from './rtc/channels.js';
@@ -511,9 +512,13 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
     guestPassword?: string;
   }): Promise<JoinRoomResult> {
     const guestEpoch = generateEpoch();
+    // Normalize the user-entered room id via Crockford base32 fuzzy decoding
+    // (case-insensitive, O→0, I→1, L→1) without rejecting malformed ids —
+    // the backend owns validation. See docs/ROOM_ID_SPEC.md §"Frontend handling".
+    const roomId = normalizeRoomId(input.roomId);
     const message: ClientMessage = {
       type: 'join-room',
-      roomId: input.roomId,
+      roomId,
       guestEpoch,
       ...(input.guestPassword !== undefined ? { guestPassword: input.guestPassword } : {}),
     };

@@ -15,7 +15,7 @@ that drove it.
 - `npm run build` — `tsc -p tsconfig.build.json` → emits ESM + declarations to `dist/`.
 - `npm run typecheck` — `tsc -p tsconfig.json --noEmit` (covers `src` + `test`).
 - `npm run lint` — `eslint .` (flat config, type-checked).
-- `npm test` — `node --test --import tsx test/*.test.ts` (158 tests; uses a
+- `npm test` — `node --test --import tsx test/*.test.ts` (168 tests; uses a
   fake WebSocket, a fake peer, and a fake `RTCPeerConnection` — no browser and
   no native WebRTC needed).
 

@@ -82,6 +82,8 @@ export {
 
 export { Transport, type WebSocketFactory, type WebSocketLike, parseFrame } from './transport.js';
 
+export { normalizeRoomId } from './roomid.js';
+
 export {
   generateEpoch,
   generateRequestId,

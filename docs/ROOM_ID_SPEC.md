@@ -66,8 +66,11 @@ Backend should automatically follow the fuzzy parsing logic set out in
 
 ## Frontend handling
 
-Frontend should NOT perform any validation or fuzzy decoding - let the backend
-handle it.
+Frontend should normalize user-entered room ids via Crockford base32 fuzzy
+decoding rules (case-insensitive, `O→0`, `I→1`, `L→1`), but should NOT reject
+ids — let the backend handle validation and rejection of malformed ids.
 
 This allows flexibility to change the schema in the future without having to
-force update all frontends.
+force update all frontends: normalization is a per-character transform that
+is safe to apply broadly, while rejection rules stay centralized on the
+backend.

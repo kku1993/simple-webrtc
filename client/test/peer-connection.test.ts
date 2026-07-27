@@ -202,14 +202,16 @@ test('guest: joinRoom builds the non-initiator peer immediately', async () => {
   const conn = makeConn(h);
   record(conn);
 
-  const joined = conn.joinRoom({ roomId: 'room-3' });
+  // Use a canonical id without O/I/L so normalization is a no-op here; the
+  // normalization behavior itself is covered by the dedicated tests below.
+  const joined = conn.joinRoom({ roomId: 'ta0003' });
   await waitForMessage(h, 'join-room');
   const joinMsg = lastOf(h, 'join-room');
   assert.ok(joinMsg);
-  assert.equal(joinMsg['roomId'], 'room-3');
+  assert.equal(joinMsg['roomId'], 'ta0003');
   assert.equal(typeof joinMsg['guestEpoch'], 'string');
 
-  h.ws.receiveMessage(joinRoomResponse('room-3', 'tok-guest', joinMsg['guestEpoch'] as string, 'host-epoch-3'));
+  h.ws.receiveMessage(joinRoomResponse('ta0003', 'tok-guest', joinMsg['guestEpoch'] as string, 'host-epoch-3'));
   const result = await joined;
 
   assert.equal(result.hostConnected, true);
@@ -218,6 +220,56 @@ test('guest: joinRoom builds the non-initiator peer immediately', async () => {
   // Guest builds its peer right away.
   assert.equal(h.peers.length, 1);
   assert.equal((h.peers[0] as FakePeer).initiator, false);
+  conn.destroy();
+});
+
+test('guest: joinRoom normalizes the room id via Crockford base32 fuzzy decoding before sending', async () => {
+  const h = createFakeHarness();
+  const conn = makeConn(h);
+  record(conn);
+
+  // User-entered id with uppercase + fuzzy-equivalent chars (O→0, I→1, L→1).
+  // The client must NOT reject this; it normalizes and lets the backend
+  // validate. See docs/ROOM_ID_SPEC.md §"Frontend handling".
+  const joined = conn.joinRoom({ roomId: 'TOl234' });
+  await waitForMessage(h, 'join-room');
+  const joinMsg = lastOf(h, 'join-room');
+  assert.ok(joinMsg);
+  assert.equal(joinMsg['roomId'], 't01234');
+  assert.equal(typeof joinMsg['guestEpoch'], 'string');
+
+  // The server responds with the canonical form; the client stores that, not
+  // the user-entered string.
+  h.ws.receiveMessage(joinRoomResponse('t01234', 'tok-guest', joinMsg['guestEpoch'] as string, 'host-epoch-n'));
+  const result = await joined;
+  void result;
+
+  assert.equal(conn.roomState?.roomId, 't01234');
+  conn.destroy();
+});
+
+test('guest: joinRoom passes through malformed ids without rejecting', async () => {
+  const h = createFakeHarness();
+  const conn = makeConn(h);
+  record(conn);
+
+  // Wrong length and a separator — still sent to the backend, which owns
+  // validation/rejection per docs/ROOM_ID_SPEC.md §"Frontend handling".
+  const joined = conn.joinRoom({ roomId: 'TA-000' });
+  await waitForMessage(h, 'join-room');
+  const joinMsg = lastOf(h, 'join-room');
+  assert.ok(joinMsg);
+  assert.equal(joinMsg['roomId'], 'ta-000');
+
+  // Reject via an error-response so the promise settles and the test cleans up.
+  h.ws.receiveMessage({
+    type: 'error-response',
+    requestId: joinMsg['requestId'] as string,
+    errorCode: ErrorCode.ROOM_CLOSED,
+    message: 'no such room',
+    retryable: false,
+  });
+  await assert.rejects(joined, (err: unknown) => err instanceof SignalingError);
   conn.destroy();
 });
 
