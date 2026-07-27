@@ -56,3 +56,23 @@ export class SignalingError extends Error {
     return Object.values(ErrorCode).some((c) => Number(c) === this.code);
   }
 }
+
+/**
+ * Thrown by `DataChannelHandle.send()` when the channel is not open and the
+ * channel's `whenClosed` policy is `'throw'`.
+ *
+ * Distinct from {@link SignalingError}: this is a local programming/timing
+ * condition on one channel, not a room or protocol failure, and it never
+ * affects the connection.
+ */
+export class DataChannelNotOpenError extends Error {
+  readonly label: string;
+  readonly readyState: RTCDataChannelState;
+
+  constructor(label: string, readyState: RTCDataChannelState) {
+    super(`Data channel "${label}" is not open (readyState: ${readyState})`);
+    this.name = 'DataChannelNotOpenError';
+    this.label = label;
+    this.readyState = readyState;
+  }
+}

@@ -16,18 +16,18 @@ export function generateEpoch(byteLength = 16): string {
   return base64url(bytes);
 }
 
-/** Cryptographically strong random bytes, working in browser and Node. */
+/**
+ * Cryptographically strong random bytes.
+ *
+ * `globalThis.crypto` is present in every browser and in Node >= 18, which
+ * covers every supported target, so there is no fallback path.
+ */
 export function randomBytes(length: number): Uint8Array {
   const g = globalThis as { crypto?: Crypto };
-  if (g.crypto?.getRandomValues) {
-    return g.crypto.getRandomValues(new Uint8Array(length));
+  if (!g.crypto?.getRandomValues) {
+    throw new Error('globalThis.crypto.getRandomValues is unavailable in this environment');
   }
-  // Node fallback (test environments without a DOM `crypto`).
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const nodeCrypto = require('node:crypto') as {
-    randomBytes: (n: number) => Buffer;
-  };
-  return new Uint8Array(nodeCrypto.randomBytes(length));
+  return g.crypto.getRandomValues(new Uint8Array(length));
 }
 
 /** RFC 4648 base64url encoding without padding. */
@@ -40,17 +40,13 @@ export function base64url(bytes: Uint8Array): string {
   return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
+/** `btoa` is a global in every browser and in Node >= 16. */
 function base64Encode(str: string): string {
   const g = globalThis as { btoa?: (s: string) => string };
-  if (g.btoa) {
-    return g.btoa(str);
+  if (!g.btoa) {
+    throw new Error('globalThis.btoa is unavailable in this environment');
   }
-  // Node fallback.
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { Buffer } = require('node:buffer') as {
-    Buffer: { from: (s: string, e: string) => { toString: (e: string) => string } };
-  };
-  return Buffer.from(str, 'binary').toString('base64');
+  return g.btoa(str);
 }
 
 /**

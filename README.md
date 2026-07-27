@@ -1,7 +1,10 @@
 # simple-peer-signal
 
-Backend server (golang) and corresponding client library (typescript)
-to handle signaling for [simple-peer](https://github.com/feross/simple-peer).
+Backend server (golang) and corresponding client library (typescript) for
+peer-to-peer WebRTC: media, plus any number of ordered and unordered data
+channels on a single connection.
+
+The client ships its own WebRTC engine and has **no runtime dependencies**.
 
 See `docs/DESIGN.md` for the full protocol, state machine, and configuration
 reference. This README covers getting both sides running end-to-end.
@@ -87,14 +90,14 @@ await guest.joinRoom({ roomId });
 
 Notes:
 
-- The host's `SimplePeer` is built only after `guest-joined` fires; the
-  guest's is built immediately on `joinRoom`. Don't construct `SimplePeer`
-  yourself — pass options via `PeerConnectionOptions.simplePeer`.
+- The host's peer is built only after `guest-joined` fires; the guest's is
+  built immediately on `joinRoom`. Don't construct one yourself — pass ICE
+  configuration via `PeerConnectionOptions.rtc`.
 - After `connect`, the server releases both sockets (close `4200`) and
-  renegotiation flows over the data channel as
-  `{ kind: "renegotiate", signal }`. The client handles this for you.
+  renegotiation flows peer-to-peer over a dedicated control channel, separate
+  from application data. The client handles this for you.
 - On a retryable socket close the client reconnects with `rejoin-room` and a
-  fresh epoch, rebuilding the `SimplePeer` only when the peer's epoch changed.
+  fresh epoch, rebuilding the peer only when the peer's epoch changed.
   Persisted `BrowserSessionStore` state lets `peer.rejoin(session)` resume
   after a page reload.
 - The client uses the global `WebSocket` (browsers and Node >= 22); no
@@ -107,14 +110,61 @@ Notes:
   off();
   ```
 
+## Data channels
+
+A connection carries any number of application data channels, each with its own
+ordering and reliability. Declare them on both sides:
+
+```ts
+const peer = new PeerConnection({
+  url: "wss://signal.example/v1/signal",
+  dataChannels: {
+    chat: {},                                       // ordered + reliable (default)
+    cursor: { ordered: false, maxRetransmits: 0 },  // unordered, fire-and-forget
+    telemetry: { ordered: false, maxPacketLifeTime: 100 }, // partially reliable
+  },
+});
+
+const chat = peer.channel("chat");
+chat.on("message", (data) => render(data));
+chat.send("hello");
+
+peer.channel("cursor").send(`${x},${y}`);
+```
+
+Notes:
+
+- `peer.channel(label)` works immediately — before `createRoom`/`joinRoom` and
+  before any peer exists. The handle reports `readyState: "connecting"` until
+  the channel opens.
+- **Handle identity is stable, channel state is not.** The returned object
+  survives peer rebuilds, so you can attach listeners once and keep the
+  reference for the life of the connection. Gate sends on `readyState`, or let
+  the `whenClosed` policy do it.
+- `whenClosed` defaults to `"buffer"` for ordered reliable channels and
+  `"throw"` for everything else, because flushing stale cursor positions after
+  a reconnect is as wrong as dropping the first chat message. Override per
+  channel with `"buffer"`, `"throw"`, or `"drop"`.
+- The host creates every declared channel and the guest binds by label, so a
+  channel's ordering and reliability always come from the host — the two sides
+  cannot disagree about them. A label declared only by the guest never opens
+  and is logged.
+- `peer.openChannel(label, spec)` opens one at runtime from either side; the
+  remote learns about it through the `channel` event.
+- `peer.on("data", ...)` and `peer.send(...)` still work and use a built-in
+  default channel. Labels beginning with `__sps_` are reserved.
+- Backpressure: read `bufferedAmount` and listen for `drain`. The library does
+  not chunk — SCTP caps a message at roughly 256 KiB and 64 KiB is the safe
+  cross-browser figure, so frame large payloads yourself.
+
 ## Voice and video
 
 The client ships first-class media support. `PeerConnection` exposes
 `addTrack`, `removeTrack`, `replaceTrack`, `addStream`, `removeStream`, and a
 higher-level `setLocalStream`. Tracks registered through these methods are
-retained in a desired-media registry and re-attached to every internal
-`SimplePeer` generation (initial construction and rebuilds after `peer-reset`),
-so callers never need to know whether the underlying peer currently exists.
+retained in a desired-media registry and re-attached to every internal peer
+generation (initial construction and rebuilds after `peer-reset`), so callers
+never need to know whether the underlying peer currently exists.
 
 ### Audio-only chat (after a button click)
 
@@ -127,7 +177,7 @@ const host = new PeerConnection({
 });
 
 // Acquire the microphone from a user gesture, then create the room. The
-// track is attached to the SimplePeer when it is built (after guest-joined).
+// track is attached to the peer when it is built (after guest-joined).
 const enableMicBtn = document.getElementById("enable-mic")!;
 enableMicBtn.addEventListener("click", async () => {
   const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -228,8 +278,8 @@ host.close();
 ### Host timing: requesting media while waiting for a guest
 
 A host may request microphone access while waiting for a guest. Tracks
-registered before `guest-joined` are attached to the `SimplePeer` when it is
-built and included in the initial offer:
+registered before `guest-joined` are attached to the peer when it is built
+and included in the initial offer:
 
 ```ts
 const host = new PeerConnection({ url: "wss://signal.example/v1/signal" });
@@ -254,18 +304,17 @@ await host.createRoom();
 
 ### Initial negotiation vs renegotiation
 
-- Tracks registered before the internal `SimplePeer` is constructed (host:
-  before `guest-joined`; guest: before `joinRoom` resolves) are included in
-  the **initial** offer/answer.
+- Tracks registered before the internal peer is constructed (host: before
+  `guest-joined`; guest: before `joinRoom` resolves) are included in the
+  **initial** offer/answer.
 - Tracks added while signaling is in progress are attached to the existing
-  peer via `addTrack`, which triggers `simple-peer`'s `signal` event and a
-  renegotiation round.
-- Multiple rapid `addTrack` calls are not batched by the wrapper; each one
-  drives its own renegotiation. `simple-peer`/the browser may coalesce them.
-- Negotiation glare (both peers add tracks simultaneously) is handled by
-  `simple-peer`'s built-in renegotiation logic; the wrapper routes both
-  directions over the data channel after socket release and forwards inbound
-  `renegotiate` frames to `peer.signal()`.
+  peer via `addTrack`, which drives a renegotiation round.
+- Multiple `addTrack` calls made in the same tick are batched into a single
+  renegotiation, and a request arriving mid-exchange is queued and runs once
+  when signaling returns to `stable`.
+- Negotiation glare cannot occur: the host is permanently the initiator and is
+  the only side that ever creates an offer. The guest requests renegotiation by
+  signaling instead, so the two sides can never offer simultaneously.
 - Media negotiation failures are reported via the `media-error` event
   (`{ message, cause? }`), distinct from the `error` event so applications
   can surface media failures without confusing them with room/signaling
@@ -281,7 +330,7 @@ The wrapper retains desired tracks across reconnect scenarios:
 2. **Remote peer rejoin with the same epoch** (`peer-rejoined`) — the
    WebRTC session continues; no media changes.
 3. **Remote peer reset with a new epoch** (`peer-reset`) — the wrapper
-   rebuilds its `SimplePeer` and re-attaches all live desired tracks to the
+   rebuilds its peer and re-attaches all live desired tracks to the
    new generation. Remote `stream`/`track` events fire again for the new
    peer; consumers should replace existing `srcObject` values.
 4. **Full page reload** — browser media permission may persist, but the old
@@ -347,7 +396,7 @@ SDP, candidate IPs, or device labels from stats by default.
 
 ```ts
 {
-  peerGeneration: 2,        // current internal SimplePeer generation
+  peerGeneration: 2,        // current internal peer generation
   hasPeer: true,
   peerConnected: true,
   desiredTrackCount: 2,     // tracks retained by the wrapper
@@ -359,16 +408,20 @@ SDP, candidate IPs, or device labels from stats by default.
 }
 ```
 
-For deeper inspection, `await peer.getStats()` passes through to the
-underlying `RTCPeerConnection.getStats()` (or returns `null` when no peer
-exists). For advanced transceiver/sender control, use the `rawPeer` escape
-hatch (typed as `SimplePeer.Instance | null`); prefer the wrapper-level
-media methods for ordinary voice/video.
+`peer.dataChannelDiagnostics` returns the same kind of snapshot per data
+channel (`label`, `readyState`, `ordered`, `bufferedAmount`, `queued`, `id`),
+never message contents.
+
+For deeper inspection, `await peer.getStats()` passes through to the underlying
+`RTCPeerConnection.getStats()` (or returns `null` when no peer exists) and
+returns the native `RTCStatsReport` unmodified. For advanced transceiver/sender
+control, use the `peerInstance` escape hatch and its `peerConnection` getter;
+prefer the wrapper-level media and channel methods for ordinary use.
 
 ## Repository layout
 
 - `server/` — Go signaling server (`cmd/server` entry point, `internal/*` packages).
-- `client/` — TypeScript source for `@simple-peer-signal/client` (wrapping `simple-peer`).
+- `client/` — TypeScript source for `@simple-peer-signal/client` (includes `src/rtc/`, the WebRTC engine).
 - `package.json` — root package face for `@simple-peer-signal/client` (installed via GitHub release tarballs).
 - `scripts/` — `build.sh` (Go server binary), `release-client.sh` (client release tarball).
 - `docs/DESIGN.md` — protocol, state machine, and configuration reference.
@@ -409,8 +462,8 @@ npm install-scripts approve esbuild   # one-off: unblock tsx's postinstall
 npm run build                         # emits ESM + .d.ts to dist/
 ```
 
-`npm test` runs the state-machine suite against a fake WebSocket + fake
-`simple-peer`, so no browser or `wrtc` is needed.
+`npm test` runs the suite against a fake WebSocket, a fake peer, and a fake
+`RTCPeerConnection`, so no browser or native WebRTC is needed.
 
 To build a release tarball (version read from the repo-root `VERSION` file,
 written to `dist/simple-peer-signal-client-<version>.tgz`):

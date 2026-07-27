@@ -2,8 +2,11 @@
 // protocol state machine deterministically without a browser or `wrtc`.
 
 import type { WebSocketLike } from '../src/transport.js';
-import type { PeerLike, SimplePeerOptions } from '../src/peer-connection.js';
-import type { SimplePeerSignalData } from '../src/types.js';
+import type { RtcPeerLike } from '../src/peer-connection.js';
+import { DataChannelHandle } from '../src/rtc/channel-handle.js';
+import { resolveSpec } from '../src/rtc/channels.js';
+import type { DataChannelSpec, RtcPeerEvents, RtcPeerOptions } from '../src/rtc/types.js';
+import type { SignalData } from '../src/rtc/signal.js';
 
 type Listener = (...args: any[]) => void;
 
@@ -72,14 +75,17 @@ export class FakeWebSocket implements WebSocketLike {
 }
 
 /**
- * A fake `simple-peer` instance. It records `signal`/`send` calls and lets
- * tests fire `signal`/`connect`/`data`/`close`/`error` events via the
- * `emit*` methods. Media methods (`addTrack`/`removeTrack`/`replaceTrack`/
- * `addStream`/`removeStream`) record their arguments so tests can assert
- * attachment behavior across peer generations.
+ * A fake internal peer. It records `signal`/`send` calls and lets tests fire
+ * `signal`/`connect`/`data`/`close`/`error` events via the `emit*` methods.
+ * Media methods record their arguments so tests can assert attachment behavior
+ * across peer generations.
+ *
+ * This stub exists to drive the protocol state machine with no engine at all.
+ * Tests that want the real engine against a fake `RTCPeerConnection` should use
+ * `rtcImpl` and the doubles in `rtc-fakes.ts` instead.
  */
-export class FakePeer implements PeerLike {
-  readonly signals: (string | SimplePeerSignalData)[] = [];
+export class FakePeer implements RtcPeerLike {
+  readonly signals: unknown[] = [];
   readonly sent: unknown[] = [];
   /** Recorded `addTrack(track, stream)` calls in order. */
   readonly addTrackCalls: { track: MediaStreamTrack; stream: MediaStream }[] = [];
@@ -103,16 +109,30 @@ export class FakePeer implements PeerLike {
   replaceTrackThrows: Error | null = null;
   /** Optional override: when set, `replaceTrack` returns this Promise. */
   replaceTrackReturns: Promise<void> | null = null;
+  /** Recorded `sendControlSignal(data)` frames in order. */
+  readonly controlSignals: SignalData[] = [];
+  /** When false, `sendControlSignal` reports the channel as unavailable. */
+  controlChannelOpen = true;
   connected = false;
   destroyed = false;
   readonly initiator: boolean;
+  readonly opts: RtcPeerOptions;
+  /** Handles supplied by the owner, or created on demand. */
+  private readonly handles: Map<string, DataChannelHandle>;
   private listeners = new Map<string, Set<Listener>>();
 
-  constructor(opts: SimplePeerOptions & { initiator: boolean }) {
+  constructor(opts: RtcPeerOptions) {
     this.initiator = opts.initiator;
+    this.opts = opts;
+    this.handles = opts.channelHandles ?? new Map<string, DataChannelHandle>();
+    for (const [label, spec] of Object.entries(opts.dataChannels ?? {})) {
+      if (!this.handles.has(label)) {
+        this.handles.set(label, new DataChannelHandle(label, resolveSpec(spec)));
+      }
+    }
   }
 
-  signal(data: string | SimplePeerSignalData): void {
+  signal(data: unknown): void {
     this.signals.push(data);
   }
 
@@ -120,9 +140,32 @@ export class FakePeer implements PeerLike {
     this.sent.push(data);
   }
 
-  destroy(_error?: Error): unknown {
+  sendControlSignal(data: SignalData): boolean {
+    if (!this.controlChannelOpen) return false;
+    this.controlSignals.push(data);
+    return true;
+  }
+
+  channel(label: string): DataChannelHandle {
+    const handle = this.handles.get(label);
+    if (!handle) throw new Error(`Unknown data channel "${label}".`);
+    return handle;
+  }
+
+  openChannel(label: string, spec: DataChannelSpec = {}): DataChannelHandle {
+    const existing = this.handles.get(label);
+    if (existing) return existing;
+    const handle = new DataChannelHandle(label, resolveSpec(spec));
+    this.handles.set(label, handle);
+    return handle;
+  }
+
+  getStats(): Promise<RTCStatsReport> {
+    return Promise.resolve(new Map() as unknown as RTCStatsReport);
+  }
+
+  destroy(_error?: Error): void {
     this.destroyed = true;
-    return undefined;
   }
 
   addTrack(track: MediaStreamTrack, stream: MediaStream): void {
@@ -139,10 +182,10 @@ export class FakePeer implements PeerLike {
     oldTrack: MediaStreamTrack,
     newTrack: MediaStreamTrack,
     stream: MediaStream,
-  ): Promise<void> | void {
+  ): Promise<void> {
     if (this.replaceTrackThrows) throw this.replaceTrackThrows;
     this.replaceTrackCalls.push({ oldTrack, newTrack, stream });
-    return this.replaceTrackReturns ?? undefined;
+    return this.replaceTrackReturns ?? Promise.resolve();
   }
 
   addStream(stream: MediaStream): void {
@@ -153,18 +196,18 @@ export class FakePeer implements PeerLike {
     this.removeStreamCalls.push({ stream });
   }
 
-  on(event: string, fn: Listener): this {
+  on<K extends keyof RtcPeerEvents>(event: K, fn: (arg: RtcPeerEvents[K]) => void): this {
     let set = this.listeners.get(event);
     if (!set) {
       set = new Set<Listener>();
       this.listeners.set(event, set);
     }
-    set.add(fn);
+    set.add(fn as Listener);
     return this;
   }
 
   // --- test driver API -----------------------------------------------------
-  emitSignal(data: SimplePeerSignalData): void {
+  emitSignal(data: SignalData): void {
     this.fire('signal', data);
   }
 
@@ -193,7 +236,12 @@ export class FakePeer implements PeerLike {
 
   /** Fire a `track` event to listeners. */
   emitTrack(track: MediaStreamTrack, stream: MediaStream): void {
-    this.fire('track', track, stream);
+    this.fire('track', { track, stream });
+  }
+
+  /** Fire a `channel-message` event to listeners. */
+  emitChannelMessage(label: string, data: unknown): void {
+    this.fire('channel-message', { label, data });
   }
 
   private fire(event: string, ...args: unknown[]): void {
@@ -262,7 +310,7 @@ export interface FakeHarness {
   ws: FakeWebSocket;
   peers: FakePeer[];
   transportFactory: (url: string) => WebSocketLike;
-  simplePeerFactory: (opts: SimplePeerOptions & { initiator: boolean }) => PeerLike;
+  peerFactory: (opts: RtcPeerOptions) => RtcPeerLike;
 }
 
 export function createFakeHarness(): FakeHarness {
@@ -278,7 +326,7 @@ export function createFakeHarness(): FakeHarness {
       ws = new FakeWebSocket(url);
       return ws;
     },
-    simplePeerFactory: (opts) => {
+    peerFactory: (opts) => {
       const p = new FakePeer(opts);
       peers.push(p);
       return p;

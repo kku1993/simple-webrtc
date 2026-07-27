@@ -1,7 +1,7 @@
 {
   "name": "@simple-peer-signal/client",
-  "version": "0.3.0",
-  "description": "TypeScript client wrapping simple-peer that speaks the signaling protocol described in docs/DESIGN.md",
+  "version": "0.4.0",
+  "description": "Zero-dependency TypeScript WebRTC client with media and multi-channel data support, speaking the signaling protocol in docs/DESIGN.md",
   "license": "MIT",
   "type": "module",
   "main": "./client/dist/index.js",
@@ -20,9 +20,6 @@
     "typecheck": "cd client && npm run typecheck",
     "lint": "cd client && npm run lint",
     "test": "cd client && npm test"
-  },
-  "dependencies": {
-    "simple-peer": "9.11.1"
   },
   "peerDependencies": {
     "ws": "^8.0.0"

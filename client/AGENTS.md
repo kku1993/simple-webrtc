@@ -1,7 +1,11 @@
 # AGENTS.md — peer-client
 
-TypeScript client wrapping `simple-peer` that speaks the signaling protocol in
+Zero-dependency TypeScript WebRTC client speaking the signaling protocol in
 `docs/DESIGN.md`. Source lives in `client/src/`, tests in `client/test/`.
+
+The client owns its WebRTC engine (`src/rtc/`) rather than depending on
+`simple-peer`; see `docs/RTC_ENGINE_PLAN.md` for the rationale and the audit
+that drove it.
 
 ## Commands (run from `client/`)
 
@@ -11,8 +15,9 @@ TypeScript client wrapping `simple-peer` that speaks the signaling protocol in
 - `npm run build` — `tsc -p tsconfig.build.json` → emits ESM + declarations to `dist/`.
 - `npm run typecheck` — `tsc -p tsconfig.json --noEmit` (covers `src` + `test`).
 - `npm run lint` — `eslint .` (flat config, type-checked).
-- `npm test` — `node --test --import tsx test/*.test.ts` (39 tests; uses fake
-  WebSocket + fake simple-peer, no `wrtc` needed).
+- `npm test` — `node --test --import tsx test/*.test.ts` (158 tests; uses a
+  fake WebSocket, a fake peer, and a fake `RTCPeerConnection` — no browser and
+  no native WebRTC needed).
 
 ## Tooling notes
 
@@ -21,28 +26,82 @@ TypeScript client wrapping `simple-peer` that speaks the signaling protocol in
   `projectService`. `tsconfig.json` includes `src` + `test` (noEmit) for lint;
   `tsconfig.build.json` emits only `src`.
 - Imports use the NodeNext `.js` extension convention.
-- `simple-peer` is a CJS `export =` module; imported as
-  `import SimplePeer from 'simple-peer'` (esModuleInterop).
+- **No runtime dependencies.** Keep it that way.
 - The client uses the global `WebSocket` (browsers and Node >= 22); no `ws`
   dependency is required.
+- `tsconfig.build.json` sets `types: []`, so `src/` must not reference Node
+  globals (`require`, `Buffer`, `process`).
+- RTC is browser-only for supported purposes. Node support covers the
+  signaling/state-machine layer, which the fakes-based suite exercises.
+  `RtcPeerOptions.rtcImpl` is the single injection point if someone wants
+  `node-datachannel`/`wrtc`; it is untested.
 
 ## Architecture
 
-`PeerConnection` (the public wrapper) owns the protocol state machine:
+Two layers:
 
-- Host: `createRoom()` → wait for `guest-joined` → build `SimplePeer({initiator:true})`.
-- Guest: `joinRoom()` → build `SimplePeer({initiator:false})` immediately.
+1. `src/rtc/` — the WebRTC engine. `RtcPeer` owns one `RTCPeerConnection`,
+   negotiation, ICE, media, and all data channels. Knows nothing about rooms or
+   the signaling protocol.
+2. `src/peer-connection.ts` — `PeerConnection`, the protocol state machine. Owns
+   rooms, epochs, reconnect, and the desired-media / channel-handle registries.
+
+### Engine (`src/rtc/`)
+
+- `peer.ts` — `RtcPeer`: lifecycle, event surface, control-channel routing.
+- `negotiation.ts` — offer/answer. Strictly initiator-driven: only the host
+  offers, the guest signals `{t:'renegotiate'}` to ask for one. Because roles
+  are fixed by the protocol, glare is impossible and there is no rollback path.
+  Requests are batched on a microtask and one queued renegotiation runs when
+  signaling returns to `stable`.
+- `ice.ts` — trickle plus the pending-candidate queue (candidates routinely
+  arrive before the description they belong to). A candidate that will not apply
+  is warned about, never fatal.
+- `channels.ts` / `channel-handle.ts` — the channel registry. **The initiator
+  creates every declared channel; the responder binds by label.** No stream-id
+  arithmetic, no collision window, and configuration mismatch is structurally
+  impossible. `DataChannelHandle` identity is stable across peer rebuilds
+  because `PeerConnection` owns the handle map and passes it into every
+  generation.
+- `media.ts` — sender map keyed by `(track, stream)`, and inbound track/stream
+  dedup. `stream` is emitted on a microtask so every track is attached first.
+- `signal.ts` — the peer-to-peer wire format. Explicitly discriminated on `t`,
+  with unknown frames ignored rather than fatal.
+- Reserved channel labels: `__sps_ctrl` (renegotiation) and `__sps_data`
+  (backs `send()` / the `data` event). Control traffic has its own channel, so
+  application data is never inspected for control frames.
+
+### Protocol state machine (`peer-connection.ts`)
+
+- Host: `createRoom()` → wait for `guest-joined` → build `RtcPeer({initiator:true})`.
+- Guest: `joinRoom()` → build `RtcPeer({initiator:false})` immediately.
 - `signal` events are sent as `{type:'signal', seq, data}`; `signal-response` is
   fed to `peer.signal()`.
 - On `peer.connect`, sends `peer-connected`. Close `4200` (room-idle-close) is
-  success — no reconnect. Subsequent renegotiation goes over the data channel
-  as `{kind:'renegotiate', signal}`.
+  success — no reconnect. Subsequent renegotiation goes peer-to-peer over the
+  engine's control channel.
 - On a retryable socket close, reconnects with `rejoin-room` and a fresh epoch
   (full-jitter backoff). `peer-reset` (other side's epoch changed) rebuilds the
-  `SimplePeer`; roles/initiator never change.
+  peer; roles/initiator never change. Data channel *handles* survive the
+  rebuild; the underlying channels do not.
 - `rejoin(session)` resumes a persisted session after a page reload.
 - State `{ roomId, role, rejoinToken, hostEpoch, guestEpoch }` is persisted via
   `RoomSessionStore` (browser `sessionStorage` or in-memory).
 
-`PeerConnection` accepts injectable `transportFactory` and `simplePeerFactory`
-options so the state machine is unit-testable without a browser or `wrtc`.
+`PeerConnection` accepts injectable `transportFactory` and `peerFactory` options
+so the state machine is unit-testable with no engine at all. To test the real
+engine instead, pass `rtcImpl` and use the doubles in `test/rtc-fakes.ts`.
+
+## Testing notes
+
+- `test/fakes.ts` — fake WebSocket + `FakePeer` (an `RtcPeerLike` stub) for
+  protocol tests.
+- `test/rtc-fakes.ts` — `FakePeerConnection` / `FakeDataChannel` for engine
+  tests. The fake maintains a real `signalingState` machine, so negotiation
+  ordering and queueing are genuinely exercised.
+- Engine behaviors that are load-bearing and easy to regress each have a named
+  test: pending-candidate flush, negotiation batching, one-queued-renegotiation,
+  non-fatal candidate rejection, inbound stream dedup + deferred emit, refusal
+  to re-add a removed track, and the both-conditions `connect` gate.
+- Not covered: real ICE/NAT behavior. There is no browser test infrastructure
+  yet — see `docs/RTC_ENGINE_PLAN.md` phase 5.

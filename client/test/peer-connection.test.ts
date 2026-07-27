@@ -70,7 +70,7 @@ function makeConn(h: FakeHarness, opts: { maxReconnectAttempts?: number } = {}) 
   return new PeerConnection({
     url: 'wss://signal.example/v1/signal',
     transportFactory: h.transportFactory,
-    simplePeerFactory: h.simplePeerFactory,
+    peerFactory: h.peerFactory,
     maxReconnectAttempts: opts.maxReconnectAttempts,
   });
 }
@@ -141,7 +141,7 @@ test('host: createRoom → guest-joined → signal relay → connect → peer-co
   assert.equal(conn.roomState?.guestEpoch, 'guest-epoch-1');
 
   // peer emits a signal → client sends {type:'signal', seq:1, data}
-  peer.emitSignal({ type: 'candidate', candidate: { candidate: 'ice-1' } as never });
+  peer.emitSignal({ v: 1, t: 'candidate', candidate: { candidate: 'ice-1' } });
   await flush();
   const sig = lastOf(h, 'signal');
   assert.ok(sig, 'expected a signal message');
@@ -439,19 +439,23 @@ test('renegotiation after socket release is sent over the data channel', async (
   h.ws.closeFromServer(CloseCode.RELEASED_AFTER_PEER_CONNECTED, 'released');
   await flush();
 
-  const signalsBefore = peer.sent.length;
-  // A new signal after release must go over the data channel, not the ws.
-  peer.emitSignal({ type: 'renegotiate', renegotiate: true });
+  const controlBefore = peer.controlSignals.length;
+  // A new signal after release must go over the control channel, not the ws —
+  // and not over the application's data channel either.
+  peer.emitSignal({ v: 1, t: 'renegotiate' });
   await flush();
-  assert.equal(peer.sent.length, signalsBefore + 1);
-  const frame = JSON.parse(peer.sent[peer.sent.length - 1] as string) as { kind: string };
-  assert.equal(frame.kind, 'renegotiate');
+  assert.equal(peer.controlSignals.length, controlBefore + 1);
+  assert.deepEqual(peer.controlSignals[peer.controlSignals.length - 1], {
+    v: 1,
+    t: 'renegotiate',
+  });
+  assert.equal(peer.sent.length, 0, 'control traffic stays off the data channel');
   // And no new signal frame on the websocket.
   assert.equal(lastOf(h, 'signal'), undefined);
   conn.destroy();
 });
 
-test('renegotiate frame received over the data channel is fed to peer.signal', async () => {
+test('renegotiation after socket release uses the control channel, not the socket', async () => {
   const h = createFakeHarness();
   const conn = makeConn(h);
   record(conn);
@@ -466,9 +470,15 @@ test('renegotiate frame received over the data channel is fed to peer.signal', a
   peer.emitConnect();
   await flush();
 
-  const before = peer.signals.length;
-  peer.emitData(JSON.stringify({ kind: 'renegotiate', signal: { type: 'renegotiate', renegotiate: true } }));
+  h.ws.receiveMessage({ type: 'room-idle-close', reason: 'peer-connected' });
   await flush();
-  assert.equal(peer.signals.length, before + 1);
+  h.ws.closeFromServer(CloseCode.RELEASED_AFTER_PEER_CONNECTED, 'released');
+  await flush();
+
+  peer.emitSignal({ v: 1, t: 'renegotiate' });
+  await flush();
+
+  assert.deepEqual(peer.controlSignals, [{ v: 1, t: 'renegotiate' }]);
+  assert.equal(lastOf(h, 'signal'), undefined, 'nothing on the released socket');
   conn.destroy();
 });

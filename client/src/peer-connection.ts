@@ -1,8 +1,6 @@
-import SimplePeer from 'simple-peer';
 import {
   type ClientMessage,
   type CreateRoomResponse,
-  type DataChannelFrame,
   type ErrorResponseMessage,
   type JoinRoomResponse,
   type RejoinRoomResponse,
@@ -13,11 +11,23 @@ import {
 } from './types.js';
 import { Emitter } from './emitter.js';
 import { SignalingError } from './errors.js';
+import type { Logger } from './logger.js';
 import { type RoomSession, type SessionStore, RoomSessionStore, MemorySessionStore } from './storage.js';
 import { Transport, type WebSocketFactory, type WebSocketLike } from './transport.js';
 import { SequenceCounter, generateEpoch, generateRequestId, fullJitterBackoff } from './util.js';
+import { RtcPeer } from './rtc/peer.js';
+import { DataChannelHandle } from './rtc/channel-handle.js';
+import { assertUsableLabel, resolveSpec } from './rtc/channels.js';
+import type { SignalData } from './rtc/signal.js';
+import type {
+  ChannelDiagnostics,
+  DataChannelSpec,
+  RtcPeerEvents,
+  RtcPeerOptions,
+} from './rtc/types.js';
 
-export { SignalingError } from './errors.js';
+export { SignalingError, DataChannelNotOpenError } from './errors.js';
+export type { Logger } from './logger.js';
 export * from './types.js';
 export * from './storage.js';
 export type { WebSocketFactory, WebSocketLike } from './transport.js';
@@ -26,66 +36,85 @@ export type { WebSocketFactory, WebSocketLike } from './transport.js';
 // Public option / result types
 // ---------------------------------------------------------------------------
 
-/** Options forwarded to `new SimplePeer(...)` except `initiator`, which is owned by this class. */
-export type SimplePeerOptions = Omit<SimplePeer.Options, 'initiator'>;
+/**
+ * Options forwarded to every internal {@link RtcPeer}. `initiator` is derived
+ * from the protocol role, and the channel registry is owned by this class, so
+ * neither is settable here.
+ */
+export type RtcOptions = Omit<
+  RtcPeerOptions,
+  'initiator' | 'channelHandles' | 'dataChannels' | 'streams'
+>;
 
 /**
- * The slice of `simple-peer`'s instance API that {@link PeerConnection} relies
- * on, including the media methods used by the wrapper's desired-media
- * registry. Declared locally so tests can inject a stub without depending on
- * `wrtc`, and so the type-checked surface stays small.
+ * The slice of {@link RtcPeer}'s API that {@link PeerConnection} relies on.
+ *
+ * Declared structurally so tests can inject a stub without a browser or any
+ * WebRTC implementation. Note that `RtcPeer` also accepts an `rtcImpl` override,
+ * which is the better seam when you want to exercise the real engine against a
+ * fake `RTCPeerConnection`; this interface exists for tests that want to drive
+ * the protocol state machine without an engine at all.
  */
-export interface PeerLike {
+export interface RtcPeerLike {
   readonly connected: boolean;
-  on(event: 'signal', fn: (data: SimplePeer.SignalData) => void): this;
-  on(event: 'connect', fn: () => void): this;
-  on(event: 'data', fn: (chunk: unknown) => void): this;
-  on(event: 'stream', fn: (stream: MediaStream) => void): this;
-  on(event: 'track', fn: (track: MediaStreamTrack, stream: MediaStream) => void): this;
-  on(event: 'close', fn: () => void): this;
-  on(event: 'error', fn: (err: Error) => void): this;
-  signal(data: string | SimplePeer.SignalData): void;
-  send(data: unknown): void;
-  destroy(error?: Error): unknown;
-  /** Add a track to the peer. No-op when the peer has been destroyed. */
-  addTrack?(track: MediaStreamTrack, stream: MediaStream): void;
-  /** Remove a track from the peer. No-op when the peer has been destroyed. */
-  removeTrack?(track: MediaStreamTrack, stream: MediaStream): void;
-  /** Replace one track with another on the peer. May return a Promise. */
-  replaceTrack?(
+  on<K extends keyof RtcPeerEvents>(event: K, fn: (arg: RtcPeerEvents[K]) => void): unknown;
+  /** Apply an inbound signal frame. Unrecognized frames are ignored, not fatal. */
+  signal(data: unknown): void;
+  /** Send on the default application channel. */
+  send(data: string | Blob | ArrayBuffer | ArrayBufferView): void;
+  /** Send a signal frame over the control channel. Returns false if it is not open. */
+  sendControlSignal(data: SignalData): boolean;
+  destroy(error?: Error): void;
+  /** Handle for a declared or dynamic channel. */
+  channel(label: string): DataChannelHandle;
+  /** Open a channel not present in the declared set. */
+  openChannel(label: string, spec?: DataChannelSpec): DataChannelHandle;
+  addTrack(track: MediaStreamTrack, stream: MediaStream): void;
+  removeTrack(track: MediaStreamTrack, stream: MediaStream): void;
+  replaceTrack(
     oldTrack: MediaStreamTrack,
     newTrack: MediaStreamTrack,
     stream: MediaStream,
-  ): Promise<void> | void;
-  /** Add a whole stream to the peer. */
-  addStream?(stream: MediaStream): void;
-  /** Remove a whole stream from the peer. */
-  removeStream?(stream: MediaStream): void;
-  /** Optional `RTCPeerConnection.getStats()` passthrough for diagnostics. */
-  getStats?(): Promise<RTCStatsReport>;
+  ): Promise<void>;
+  addStream(stream: MediaStream): void;
+  removeStream(stream: MediaStream): void;
+  getStats(): Promise<RTCStatsReport>;
+  /** Per-channel diagnostics. */
+  readonly channelDiagnostics?: ChannelDiagnostics[];
 }
 
-/** Factory used to construct each `SimplePeer`. Overridable for tests. */
-export type SimplePeerFactory = (opts: SimplePeerOptions & { initiator: boolean }) => PeerLike;
-
-export interface Logger {
-  debug?(msg: string, ctx?: Record<string, unknown>): void;
-  info?(msg: string, ctx?: Record<string, unknown>): void;
-  warn?(msg: string, ctx?: Record<string, unknown>): void;
-  error?(msg: string, ctx?: Record<string, unknown>): void;
-}
+/** Factory used to construct each internal peer. Overridable for tests. */
+export type RtcPeerFactory = (opts: RtcPeerOptions) => RtcPeerLike;
 
 export interface PeerConnectionOptions {
   /** WebSocket URL of the signaling endpoint, e.g. `wss://host/v1/signal`. */
   url: string;
-  /** Options forwarded to every `new SimplePeer(...)` (config, streams, …). */
-  simplePeer?: SimplePeerOptions;
+  /** Options forwarded to every internal {@link RtcPeer} (ICE config, SDP hooks). */
+  rtc?: RtcOptions;
+  /**
+   * Application data channels to open, keyed by label.
+   *
+   * Both peers should declare the same set. The host creates them and the guest
+   * binds by label, so a channel's ordering and reliability always come from the
+   * host and the two sides cannot disagree about them.
+   *
+   * ```ts
+   * dataChannels: {
+   *   chat: {},                                    // ordered, reliable
+   *   cursor: { ordered: false, maxRetransmits: 0 } // unordered, fire-and-forget
+   * }
+   * ```
+   *
+   * Handles are available from {@link PeerConnection.channel} immediately, before
+   * any room exists, and keep their identity across peer rebuilds.
+   */
+  dataChannels?: Record<string, DataChannelSpec>;
   /** Persistence for `{ roomId, role, rejoinToken, epochs }`. Defaults to in-memory. */
   store?: SessionStore;
   /** Override the WebSocket constructor (mainly for tests). */
   transportFactory?: WebSocketFactory;
-  /** Override the `SimplePeer` constructor (mainly for tests). */
-  simplePeerFactory?: SimplePeerFactory;
+  /** Override the internal peer constructor (mainly for tests). */
+  peerFactory?: RtcPeerFactory;
   /** Structured logger; defaults to no-op. */
   logger?: Logger;
   /**
@@ -95,9 +124,9 @@ export interface PeerConnectionOptions {
    */
   maxReconnectAttempts?: number;
   /**
-   * Optional local `MediaStream` to attach to every internal `SimplePeer`
-   * generation. Equivalent to calling {@link PeerConnection.setLocalStream}
-   * before `createRoom`/`joinRoom`. Useful when media is acquired before the
+   * Optional local `MediaStream` to attach to every internal peer generation.
+   * Equivalent to calling {@link PeerConnection.setLocalStream} before
+   * `createRoom`/`joinRoom`. Useful when media is acquired before the
    * connection is constructed (e.g. from a permissions prompt triggered by a
    * user gesture in the lobby).
    */
@@ -158,11 +187,11 @@ export type PeerStatus =
  * Returned by {@link PeerConnection.mediaDiagnostics}.
  */
 export interface MediaDiagnostics {
-  /** Current internal `SimplePeer` generation (0 before the first peer is built). */
+  /** Current internal peer generation (0 before the first peer is built). */
   peerGeneration: number;
-  /** Whether an internal `SimplePeer` currently exists. */
+  /** Whether an internal peer currently exists. */
   hasPeer: boolean;
-  /** Whether the internal `SimplePeer` reports `connected`. */
+  /** Whether the internal peer reports `connected`. */
   peerConnected: boolean;
   /** Number of desired tracks currently retained by the wrapper. */
   desiredTrackCount: number;
@@ -179,25 +208,39 @@ export interface PeerConnectionEvents {
   status: PeerStatus;
   /** Host only: the guest joined. The SimplePeer is being constructed now. */
   'guest-joined': { guestEpoch: string };
-  /** The underlying simple-peer connected (P2P established). */
+  /** The underlying peer connected (P2P established). */
   connect: void;
-  /** Data received over the P2P data channel. */
+  /** Data received on the default data channel. */
   data: unknown;
   /** A remote media stream was added. */
   stream: MediaStream;
   /** A remote track was added. */
   track: { track: MediaStreamTrack; stream: MediaStream };
+  /** A declared or dynamic data channel opened. */
+  'channel-open': { label: string; channel: DataChannelHandle };
+  /** A data channel closed, including via a peer rebuild. */
+  'channel-close': { label: string };
+  /** A message arrived on a named channel other than the default one. */
+  'channel-message': { label: string; data: unknown };
+  /** The remote peer opened a channel this side had not declared. */
+  channel: { label: string; channel: DataChannelHandle };
   /**
-   * A new internal `SimplePeer` generation was constructed. Tracks registered
-   * through {@link PeerConnection.addTrack} / {@link PeerConnection.setLocalStream}
-   * have already been attached when this fires. Use this for advanced cases
-   * that need the raw peer (transceivers, sender parameters, `getStats`).
+   * A data channel failure. Non-fatal and scoped to one channel — the
+   * connection, media, and other channels are unaffected. Distinct from
+   * `error` (room/signaling) and `media-error` (tracks).
    */
-  'peer-created': { peer: PeerLike; generation: number };
+  'channel-error': { label: string; message: string; cause?: unknown };
   /**
-   * An internal `SimplePeer` generation was destroyed (peer rebuild, close,
-   * or terminal error). `reason` is one of `'rebuild'`, `'close'`,
-   * `'user-close'`, `'terminal'`.
+   * A new internal peer generation was constructed. Tracks registered through
+   * {@link PeerConnection.addTrack} / {@link PeerConnection.setLocalStream} have
+   * already been attached when this fires. Use this for advanced cases that need
+   * the raw peer (transceivers, sender parameters, `getStats`).
+   */
+  'peer-created': { peer: RtcPeerLike; generation: number };
+  /**
+   * An internal peer generation was destroyed (peer rebuild, close, or terminal
+   * error). `reason` is one of `'rebuild'`, `'close'`, `'user-close'`,
+   * `'terminal'`.
    */
   'peer-destroyed': { generation: number; reason: PeerDestroyedReason };
   /** The other side's socket dropped (P2P may survive). */
@@ -274,17 +317,21 @@ interface DesiredTrackEntry {
  * changed.
  */
 export class PeerConnection extends Emitter<PeerConnectionEvents> {
-  private readonly opts: Required<Omit<PeerConnectionOptions, 'simplePeer' | 'store' | 'transportFactory' | 'simplePeerFactory' | 'logger' | 'localStream'>>;
-  private readonly simplePeerOpts: SimplePeerOptions;
+  private readonly opts: {
+    url: string;
+    maxReconnectAttempts: number;
+  };
+  private readonly rtcOpts: RtcOptions;
+  private readonly declaredChannels: Record<string, DataChannelSpec>;
   private readonly sessionStore: RoomSessionStore;
   private readonly transport: Transport;
   private readonly log: Logger;
-  private readonly createPeer: SimplePeerFactory;
+  private readonly createPeer: RtcPeerFactory;
 
   /** Current room state, or null before a successful handshake. */
   private state: RoomState | null = null;
-  /** The underlying simple-peer instance, when one exists. */
-  private peer: PeerLike | null = null;
+  /** The underlying peer instance, when one exists. */
+  private peer: RtcPeerLike | null = null;
   private seq = new SequenceCounter();
   /** True once the server has released our socket (close 4200). */
   private socketReleased = false;
@@ -315,7 +362,7 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
    * that live tracks are re-attached to a replacement peer after `peer-reset`.
    *
    * Deduplication is by track identity (`MediaStreamTrack.id`), since
-   * `simple-peer.addTrack()` returns `void` and cannot itself indicate whether
+   * `addTrack()` returns `void` and cannot itself indicate whether
    * attachment succeeded. A `Set` of peer generations that have already seen
    * a given track prevents double-attachment to a single peer.
    */
@@ -328,17 +375,36 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
    */
   private localStream: MediaStream | null = null;
 
+  /**
+   * Stable data channel handles, keyed by label.
+   *
+   * Owned here rather than by the internal peer, because the peer is thrown
+   * away and rebuilt on every epoch change while the application's
+   * `channel('chat')` reference is not. Each new peer generation binds fresh
+   * `RTCDataChannel`s into these same objects.
+   */
+  private readonly channelHandles = new Map<string, DataChannelHandle>();
+
   constructor(opts: PeerConnectionOptions) {
     super();
     this.opts = {
       url: opts.url,
       maxReconnectAttempts: opts.maxReconnectAttempts ?? Infinity,
     };
-    this.simplePeerOpts = opts.simplePeer ?? {};
+    this.rtcOpts = opts.rtc ?? {};
+    this.declaredChannels = opts.dataChannels ?? {};
     this.sessionStore = new RoomSessionStore(opts.store ?? new MemorySessionStore());
     this.log = opts.logger ?? {};
-    this.createPeer = opts.simplePeerFactory ?? ((o) => new SimplePeer(o));
+    this.createPeer = opts.peerFactory ?? ((o) => new RtcPeer(o));
     this.transport = new Transport(opts.transportFactory);
+
+    // Materialize handles up front so `channel()` works before any room exists
+    // — the same contract the media API offers.
+    for (const [label, spec] of Object.entries(this.declaredChannels)) {
+      assertUsableLabel(label);
+      this.channelHandles.set(label, new DataChannelHandle(label, resolveSpec(spec)));
+    }
+
     if (opts.localStream) this.setLocalStream(opts.localStream);
     this.wireTransport();
   }
@@ -363,33 +429,17 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
   }
 
   /**
-   * The underlying `simple-peer` instance, when one has been constructed.
-   * Returns the {@link PeerLike} view, which exposes the media methods used
-   * internally. Most applications should call {@link PeerConnection.addTrack}
-   * / {@link PeerConnection.setLocalStream} instead of reaching through this
-   * getter; it is retained as an escape hatch for advanced use cases
-   * (transceivers, sender parameters, screen sharing).
+   * The underlying {@link RtcPeer}, when one has been constructed.
    *
-   * The instance is replaced on every peer rebuild, so callers must re-fetch
-   * it after `peer-created` / `peer-destroyed` rather than caching it.
+   * Most applications should use the wrapper's own media and channel methods,
+   * which survive peer rebuilds; this is the escape hatch for advanced cases
+   * (transceivers, sender parameters, `peerConnection` access).
+   *
+   * The instance is replaced on every peer rebuild, so callers must re-fetch it
+   * after `peer-created` / `peer-destroyed` rather than caching it.
    */
-  get simplePeer(): PeerLike | null {
+  get peerInstance(): RtcPeerLike | null {
     return this.peer;
-  }
-
-  /**
-   * The underlying `simple-peer` instance typed as `SimplePeer.Instance`, for
-   * advanced consumers that need the full surface (transceivers, sender
-   * parameters, `getStats`, screen sharing). Returns `null` when no peer is
-   * currently constructed.
-   *
-   * This is an explicit escape hatch: the type is wider than {@link simplePeer}
-   * so consumers do not need a cast, but the wrapper makes no stability
-   * guarantees about the instance across rebuilds. Prefer the wrapper-level
-   * media methods for ordinary voice/video.
-   */
-  get rawPeer(): SimplePeer.Instance | null {
-    return this.peer as unknown as SimplePeer.Instance | null;
   }
 
   /** True once the P2P connection is established. */
@@ -549,7 +599,7 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
     if (!track) return;
     this.desiredTracks.delete(track.id);
     const peer = this.peer;
-    if (!peer || !peer.removeTrack) return;
+    if (!peer) return;
     try {
       peer.removeTrack(track, stream);
     } catch (e) {
@@ -563,11 +613,9 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
    * re-attached to future peer generations); the old track is removed from the
    * registry but not stopped.
    *
-   * Returns the value yielded by `simple-peer.replaceTrack` (which may be a
-   * `Promise<void>` or `void` depending on the underlying implementation). If
-   * no peer currently exists, the registry is updated synchronously and
-   * `undefined` is returned; the new track will be attached when the next peer
-   * is built.
+   * Returns the promise from the underlying `replaceTrack`. If no peer
+   * currently exists, the registry is updated synchronously and `undefined` is
+   * returned; the new track will be attached when the next peer is built.
    */
   replaceTrack(
     oldTrack: MediaStreamTrack,
@@ -583,20 +631,18 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
       this.desiredTracks.set(newTrack.id, { track: newTrack, stream, attachedGenerations: new Set() });
     }
     const peer = this.peer;
-    if (!peer || !peer.replaceTrack) {
+    if (!peer) {
       // No peer yet — the new track will be attached when the next peer is built.
       return;
     }
     try {
-      const ret = peer.replaceTrack(oldTrack, newTrack, stream);
-      if (ret && typeof ret.then === 'function') {
-        return ret.catch((e) => {
-          this.emitMediaError('replaceTrack rejected', e);
-          throw e;
-        });
-      }
-      return ret;
+      return peer.replaceTrack(oldTrack, newTrack, stream).catch((e: unknown) => {
+        this.emitMediaError('replaceTrack rejected', e);
+        throw e;
+      });
     } catch (e) {
+      // A synchronous throw (bad arguments, destroyed peer) rather than a
+      // rejected promise.
       this.emitMediaError('replaceTrack threw', e);
       throw e;
     }
@@ -684,14 +730,88 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
 
   /**
    * Passthrough to the underlying `RTCPeerConnection.getStats()` when an
-   * internal `SimplePeer` exists. Returns `null` when no peer is currently
+   * internal peer exists. Returns `null` when no peer is currently
    * constructed. Useful for connection-quality monitoring; consumers should
    * avoid logging SDP, candidate IPs, or device labels from the report.
    */
   async getStats(): Promise<RTCStatsReport | null> {
     const peer = this.peer;
-    if (!peer || !peer.getStats) return null;
+    if (!peer) return null;
     return peer.getStats();
+  }
+
+  // -------------------------------------------------------------------------
+  // Data channel API
+  //
+  // Like the media API, these accept calls before room creation, while waiting
+  // for a peer, and after connection. Handles are created eagerly and rebound
+  // to each new peer generation, so callers never need to know whether an
+  // internal peer currently exists.
+  // -------------------------------------------------------------------------
+
+  /**
+   * The stable handle for a declared or dynamic data channel.
+   *
+   * Callable before `createRoom` / `joinRoom`, in which case the handle reports
+   * `'connecting'` until the peer is built and the channel opens. The returned
+   * object keeps its identity for the lifetime of this connection, including
+   * across peer rebuilds, so it is safe to retain and to attach listeners to
+   * exactly once.
+   *
+   * @throws {Error} for a label that was neither declared in `dataChannels` nor
+   *   opened via {@link openChannel}.
+   */
+  channel(label: string): DataChannelHandle {
+    assertUsableLabel(label);
+    const handle = this.channelHandles.get(label);
+    if (!handle) {
+      throw new Error(
+        `Unknown data channel "${label}". Declare it in options.dataChannels or call openChannel().`,
+      );
+    }
+    return handle;
+  }
+
+  /**
+   * Open a data channel that was not declared at construction.
+   *
+   * Safe from either side. If no peer exists yet the handle is registered and
+   * the channel is created when the next peer is built, so this may be called
+   * at any point in the lifecycle.
+   */
+  openChannel(label: string, spec: DataChannelSpec = {}): DataChannelHandle {
+    assertUsableLabel(label);
+    // Join the declared set so the channel is recreated on every subsequent
+    // peer generation. Without this a channel opened at runtime would vanish at
+    // the next epoch change, leaving the application holding a handle that
+    // never reopens.
+    this.declaredChannels[label] = spec;
+
+    const existing = this.channelHandles.get(label);
+    if (existing) {
+      // Already known: make sure the current peer has actually created it.
+      if (this.peer) this.peer.openChannel(label, spec);
+      return existing;
+    }
+    if (this.peer) return this.peer.openChannel(label, spec);
+    // No peer yet — register the handle now; the next generation creates the
+    // underlying channel from the declared set.
+    const handle = new DataChannelHandle(label, resolveSpec(spec));
+    this.channelHandles.set(label, handle);
+    return handle;
+  }
+
+  /** Every known data channel handle, keyed by label. */
+  get channels(): ReadonlyMap<string, DataChannelHandle> {
+    return new Map(this.channelHandles);
+  }
+
+  /**
+   * Per-channel diagnostics for the current peer generation. Carries no message
+   * contents. Empty when no peer exists.
+   */
+  get dataChannelDiagnostics(): ChannelDiagnostics[] {
+    return this.peer?.channelDiagnostics ?? [];
   }
 
   /**
@@ -718,6 +838,7 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
     this.destroyPeer('user-close');
     this.desiredTracks.clear();
     this.localStream = null;
+    this.disposeChannels();
     this.transport.close(CloseCodeEnum.ROOM_CLOSED, reason);
     this.setStatus('closed');
     this.emitClose(reason);
@@ -730,7 +851,17 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
     this.destroyPeer('user-close');
     this.desiredTracks.clear();
     this.localStream = null;
+    this.disposeChannels();
     this.transport.close();
+  }
+
+  /**
+   * Retire every channel handle. Called only from `close`/`destroy` — a peer
+   * rebuild must leave handles alive, since the application still holds them.
+   */
+  private disposeChannels(): void {
+    for (const handle of this.channelHandles.values()) handle.dispose();
+    this.channelHandles.clear();
   }
 
   // -------------------------------------------------------------------------
@@ -967,13 +1098,21 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
   private maybeBuildPeer(opts: { initiator: boolean }): boolean {
     if (this.peer) return false;
     const initiator = opts.initiator;
-    const peer = this.createPeer({ ...this.simplePeerOpts, initiator });
+    const peer = this.createPeer({
+      ...this.rtcOpts,
+      initiator,
+      dataChannels: this.declaredChannels,
+      // The same handle map for every generation, so application references
+      // stay valid across rebuilds.
+      channelHandles: this.channelHandles,
+      ...(this.rtcOpts.logger === undefined ? { logger: this.log } : {}),
+    });
     this.wirePeer(peer);
     this.peer = peer;
     this.peerGenerationField += 1;
     const generation = this.peerGenerationField;
     this.seq.reset();
-    this.log.info?.('constructed SimplePeer', { initiator, generation });
+    this.log.info?.('constructed peer', { initiator, generation });
     // Attach desired media BEFORE firing peer-created so that handlers see the
     // tracks already included in the initial offer/answer.
     this.attachDesiredTracksToPeer(peer, generation);
@@ -982,7 +1121,7 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
     return true;
   }
 
-  private wirePeer(peer: PeerLike): void {
+  private wirePeer(peer: RtcPeerLike): void {
     peer.on('signal', (data) => this.sendSignal(data));
     peer.on('connect', () => {
       this.log.info?.('peer connected');
@@ -990,9 +1129,14 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
       this.sendPeerConnected();
       this.emit('connect', undefined);
     });
-    peer.on('data', (chunk) => this.handlePeerData(chunk));
+    peer.on('data', (chunk) => this.emit('data', chunk));
     peer.on('stream', (stream) => this.emit('stream', stream));
-    peer.on('track', (track, stream) => this.emit('track', { track, stream }));
+    peer.on('track', ({ track, stream }) => this.emit('track', { track, stream }));
+    peer.on('channel-open', (e) => this.emit('channel-open', e));
+    peer.on('channel-close', (e) => this.emit('channel-close', e));
+    peer.on('channel-message', (e) => this.emit('channel-message', e));
+    peer.on('channel-error', (e) => this.emit('channel-error', e));
+    peer.on('channel', (e) => this.emit('channel', e));
     peer.on('close', () => {
       this.log.info?.('peer close');
       const generation = this.peerGenerationField;
@@ -1007,7 +1151,7 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
     });
     peer.on('error', (err) => {
       this.log.error?.('peer error', { message: err.message });
-      // simple-peer emits `close` after `error`, which drives reconnect.
+      // The engine always emits `close` after `error`, which drives reconnect.
     });
   }
 
@@ -1029,7 +1173,7 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
     this.destroyPeer('rebuild');
     // Note: we do NOT change our own epoch here. A peer-reset from the server
     // means the *other* side changed epoch; our epoch stays the same and our
-    // seq counter resets only because we built a new SimplePeer.
+    // seq counter resets only because we built a new peer.
     this.maybeBuildPeer({ initiator: this.state?.role === 'host' });
   }
 
@@ -1043,8 +1187,7 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
    * registry). Each track is attached at most once per generation via the
    * `attachedGenerations` set on its entry.
    */
-  private attachDesiredTracksToPeer(peer: PeerLike, generation: number): void {
-    if (!peer.addTrack) return;
+  private attachDesiredTracksToPeer(peer: RtcPeerLike, generation: number): void {
     for (const [id, entry] of this.desiredTracks) {
       if (entry.track.readyState === 'ended') {
         this.desiredTracks.delete(id);
@@ -1071,7 +1214,7 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
   ): void {
     if (track.readyState === 'ended') return;
     const peer = this.peer;
-    if (!peer || !peer.addTrack) return;
+    if (!peer) return;
     const entry = this.desiredTracks.get(id);
     if (!entry) return;
     const generation = this.peerGenerationField;
@@ -1093,16 +1236,14 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
   // Signaling relay
   // -------------------------------------------------------------------------
 
-  private sendSignal(data: SimplePeer.SignalData): void {
+  private sendSignal(data: SignalData): void {
     const payload = JSON.stringify(data);
     if (this.socketReleased && this.peer?.connected) {
-      // After the server released the sockets, carry renegotiation over the
-      // data channel. See DESIGN.md "Renegotiation after socket release".
-      const frame: DataChannelFrame = { kind: 'renegotiate', signal: data };
-      try {
-        this.peer.send(JSON.stringify(frame));
-      } catch (e) {
-        this.log.error?.('failed to send renegotiate frame', { message: (e as Error).message });
+      // After the server released the sockets, carry renegotiation peer-to-peer
+      // over the engine's dedicated control channel. See DESIGN.md
+      // "Renegotiation after socket release".
+      if (!this.peer.sendControlSignal(data)) {
+        this.log.error?.('failed to send control signal: channel not open');
       }
       return;
     }
@@ -1132,7 +1273,7 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
       return;
     }
     try {
-      this.peer.signal(data as SimplePeer.SignalData);
+      this.peer.signal(data);
     } catch (e) {
       this.log.warn?.('peer.signal threw', { seq: msg.seq, message: (e as Error).message });
     }
@@ -1144,31 +1285,6 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
       this.transport.send({ type: 'peer-connected' });
     } catch (e) {
       this.log.warn?.('failed to send peer-connected', { message: (e as Error).message });
-    }
-  }
-
-  // -------------------------------------------------------------------------
-  // Data channel framing (renegotiation after socket release)
-  // -------------------------------------------------------------------------
-
-  private handlePeerData(chunk: unknown): void {
-    // Emit raw data to the application.
-    this.emit('data', chunk);
-    // If it's a string, try to interpret as a control frame.
-    if (typeof chunk !== 'string') return;
-    let frame: unknown;
-    try {
-      frame = JSON.parse(chunk);
-    } catch {
-      return;
-    }
-    if (!isDataChannelFrame(frame)) return;
-    if (frame.kind === 'renegotiate' && this.peer) {
-      try {
-        this.peer.signal(frame.signal);
-      } catch (e) {
-        this.log.warn?.('renegotiate peer.signal threw', { message: (e as Error).message });
-      }
     }
   }
 
@@ -1411,10 +1527,4 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
   private emitClose(reason: string): void {
     this.emit('close', { reason });
   }
-}
-
-function isDataChannelFrame(v: unknown): v is DataChannelFrame {
-  if (!v || typeof v !== 'object') return false;
-  const o = v as { kind?: unknown };
-  return o.kind === 'renegotiate';
 }

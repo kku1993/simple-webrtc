@@ -86,7 +86,7 @@ function makeConn(h: FakeHarness): PeerConnection {
   return new PeerConnection({
     url: 'wss://signal.example/v1/signal',
     transportFactory: h.transportFactory,
-    simplePeerFactory: h.simplePeerFactory,
+    peerFactory: h.peerFactory,
   });
 }
 
@@ -398,7 +398,7 @@ test('localStream constructor option attaches tracks to the first peer', async (
   const conn = new PeerConnection({
     url: 'wss://signal.example/v1/signal',
     transportFactory: h.transportFactory,
-    simplePeerFactory: h.simplePeerFactory,
+    peerFactory: h.peerFactory,
     localStream: stream,
   });
   assert.equal(conn.currentLocalStream, stream);
@@ -494,16 +494,16 @@ test('on() returns an unsubscribe function (rec 7)', async () => {
   conn.destroy();
 });
 
-test('rawPeer escape hatch returns the underlying peer or null', async () => {
+test('peerInstance escape hatch returns the underlying peer or null', async () => {
   const h = createFakeHarness();
   const conn = await hostCreatesRoom(h);
-  assert.equal(conn.rawPeer, null);
+  assert.equal(conn.peerInstance, null);
   h.ws.receiveMessage({ type: 'guest-joined', guestEpoch: 'guest-ep-raw' });
   await flush();
-  assert.ok(conn.rawPeer !== null);
-  // After destroy, rawPeer becomes null again.
+  assert.ok(conn.peerInstance !== null);
+  // After destroy, peerInstance becomes null again.
   conn.destroy();
-  assert.equal(conn.rawPeer, null);
+  assert.equal(conn.peerInstance, null);
 });
 
 test('getStats passthrough returns null when no peer exists', async () => {
@@ -514,10 +514,11 @@ test('getStats passthrough returns null when no peer exists', async () => {
   conn.destroy();
 });
 
-test('renegotiation glare: simultaneous addTrack on both peers does not corrupt data frames', async () => {
-  // This test exercises the wrapper's desired-media registry under a
-  // renegotiation that happens while a data frame is in flight. The wrapper
-  // must not interleave media attachment with data-channel framing.
+test('application data is never diverted into signaling, whatever it looks like', async () => {
+  // Renegotiation after socket release travels on the engine's dedicated
+  // control channel, so the application's data stream is never inspected for
+  // control frames. This is what makes an app payload that happens to look like
+  // one safe.
   const h = createFakeHarness();
   const conn = await hostCreatesRoom(h);
   h.ws.receiveMessage({ type: 'guest-joined', guestEpoch: 'guest-ep-glare' });
@@ -526,7 +527,7 @@ test('renegotiation glare: simultaneous addTrack on both peers does not corrupt 
   peer.emitConnect();
   await flush();
 
-  // Release the socket so renegotiation goes over the data channel.
+  // Release the socket so renegotiation would go peer-to-peer.
   h.ws.receiveMessage({ type: 'room-idle-close', reason: 'peer-connected' });
   await flush();
   h.ws.closeFromServer(CloseCode.RELEASED_AFTER_PEER_CONNECTED, 'released');
@@ -535,28 +536,19 @@ test('renegotiation glare: simultaneous addTrack on both peers does not corrupt 
   const dataReceived: unknown[] = [];
   conn.on('data', (d) => dataReceived.push(d));
 
-  // Interleave a data frame, a local addTrack (which triggers an outbound
-  // renegotiate signal over the data channel), and an inbound renegotiate
-  // frame from the remote peer. The wrapper must keep data frames and
-  // renegotiation control frames separate.
-  peer.emitData('hello-data');
-  const stream = asStream(new FakeStream());
-  conn.addTrack(asTrack(new FakeTrack({ kind: 'audio' })), stream);
-  // Inbound renegotiate frame from the remote peer must be fed to peer.signal.
+  // Interleave application data with a payload shaped exactly like a control
+  // frame, plus a local addTrack that triggers outbound renegotiation.
   const beforeSignals = peer.signals.length;
-  const renegotiateFrame = JSON.stringify({
-    kind: 'renegotiate',
-    signal: { type: 'renegotiate', renegotiate: true },
-  });
-  peer.emitData(renegotiateFrame);
+  const lookalike = JSON.stringify({ v: 1, t: 'renegotiate' });
+  peer.emitData('hello-data');
+  conn.addTrack(asTrack(new FakeTrack({ kind: 'audio' })), asStream(new FakeStream()));
+  peer.emitData(lookalike);
   peer.emitData('world-data');
   await flush();
 
-  // The wrapper emits every chunk to `data` (including control frames, which
-  // is existing behavior), but application data must still arrive intact and
-  // in order. The renegotiate frame must additionally be forwarded to
-  // peer.signal without corrupting the surrounding data frames.
-  assert.deepEqual(dataReceived, ['hello-data', renegotiateFrame, 'world-data']);
-  assert.equal(peer.signals.length, beforeSignals + 1);
+  // Every chunk reaches the application intact and in order...
+  assert.deepEqual(dataReceived, ['hello-data', lookalike, 'world-data']);
+  // ...and none of it was mistaken for protocol traffic.
+  assert.equal(peer.signals.length, beforeSignals);
   conn.destroy();
 });

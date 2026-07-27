@@ -52,16 +52,19 @@ the full list.
 
 ## Client (`client/`)
 
-A TypeScript client wrapping [`simple-peer`](https://github.com/feross/simple-peer)
-that speaks the protocol in `docs/DESIGN.md` against the Go server above. See
-`client/AGENTS.md` for the full client notes; summary below.
+A zero-dependency TypeScript WebRTC client that speaks the protocol in
+`docs/DESIGN.md` against the Go server above. It owns its WebRTC engine rather
+than depending on `simple-peer` — see `docs/RTC_ENGINE_PLAN.md`. Full notes in
+`client/AGENTS.md`; summary below.
 
 ### Layout
 
-- `client/src/types.ts` — protocol message types, `CloseCode`, `ErrorCode`,
-  renegotiation frame.
+- `client/src/types.ts` — protocol message types, `CloseCode`, `ErrorCode`.
+- `client/src/rtc/` — the WebRTC engine: `RtcPeer` (lifecycle), `negotiation`,
+  `ice`, `channels` + `channel-handle` (multi-channel data), `media`, `signal`
+  (peer-to-peer wire format), `env` (the one `RTCPeerConnection` seam).
 - `client/src/peer-connection.ts` — `PeerConnection`, the public wrapper that
-  ties `simple-peer` to the protocol state machine.
+  ties `RtcPeer` to the protocol state machine.
 - `client/src/transport.ts` — WebSocket wrapper (global `WebSocket`,
   browsers + Node >= 22).
 - `client/src/storage.ts` — `sessionStorage` persistence of
@@ -71,9 +74,12 @@ that speaks the protocol in `docs/DESIGN.md` against the Go server above. See
 - `client/src/util.ts` — base64url epoch generation, sequence counter,
   full-jitter backoff.
 - `client/src/emitter.ts` — minimal typed event emitter (no `events` dep).
+- `client/src/logger.ts` — the shared `Logger` interface.
 - `client/src/index.ts` — public barrel.
-- `client/test/` — `node:test` suite; `fakes.ts` provides a fake WebSocket and
-  fake `simple-peer` so the state machine is exercised without `wrtc`.
+- `client/test/` — `node:test` suite. `fakes.ts` provides a fake WebSocket and a
+  fake peer for protocol tests; `rtc-fakes.ts` provides a fake
+  `RTCPeerConnection` and `RTCDataChannel` for engine tests. No browser or
+  native WebRTC needed.
 
 ### Build / test
 
@@ -84,8 +90,10 @@ npm install-scripts approve esbuild   # one-off: unblock tsx's postinstall
 npm run build       # tsc -p tsconfig.build.json  -> dist/
 npm run typecheck   # tsc -p tsconfig.json --noEmit (src + test)
 npm run lint        # eslint .  (flat config, type-checked)
-npm test            # node --test --import tsx test/*.test.ts
+npm test            # node --test --import tsx test/*.test.ts (158 tests)
 ```
+
+The client has **no runtime dependencies**. Keep it that way.
 
 ### Tooling notes
 
@@ -94,10 +102,10 @@ npm test            # node --test --import tsx test/*.test.ts
   `projectService`. `tsconfig.json` includes `src` + `test` (noEmit) for lint;
   `tsconfig.build.json` emits only `src`.
 - Imports use the NodeNext `.js` extension convention.
-- `simple-peer` is a CJS `export =` module; imported as
-  `import SimplePeer from 'simple-peer'` (esModuleInterop).
+- `tsconfig.build.json` sets `types: []`, so `src/` must not reference Node
+  globals (`require`, `Buffer`, `process`).
 - `ws` is an optional peer dependency (Node only); browsers use native
-  `WebSocket`.
+  `WebSocket`. RTC itself is browser-only for supported purposes.
 - `npm audit` flags a high-severity advisory in `brace-expansion` (transitive
   via eslint's `minimatch`); the fix requires eslint 10.8.0, published
   2026-07-24, which is within the 7-day freshness window and therefore pinned
@@ -108,20 +116,25 @@ npm test            # node --test --import tsx test/*.test.ts
 
 - `createRoom` (host) / `joinRoom` (guest) / `rejoin` (recovery from a
   persisted session).
-- Host waits for `guest-joined` before building the initiator `SimplePeer`;
-  guest builds the non-initiator peer immediately on join.
+- Host waits for `guest-joined` before building the initiator peer; guest
+  builds the non-initiator peer immediately on join.
 - `signal` ↔ `signal-response` relay with per-(slot,epoch) `seq`.
 - Sends `peer-connected` on `connect`; treats close `4200` (room-idle-close) as
   success — no reconnect.
-- Renegotiation routed over the data channel as `{kind:'renegotiate', signal}`
-  once the server has released the sockets.
+- Renegotiation routed peer-to-peer over a dedicated control channel once the
+  server has released the sockets, keeping protocol frames off the application's
+  data stream.
 - Reconnect with a fresh epoch + `rejoin-room` on retryable closes (`4008`,
   `4014`, `4300`); terminal handling for `4013` / `4400`.
-- Symmetric epoch comparison: rebuilds `SimplePeer` when the peer's epoch
-  changed (`peer-reset`), keeps it on `peer-rejoined`; roles/initiator never
-  change.
+- Symmetric epoch comparison: rebuilds the peer when the remote's epoch changed
+  (`peer-reset`), keeps it on `peer-rejoined`; roles/initiator never change.
+  Data channel handles survive the rebuild.
 - `SIGNAL_BUFFER_OVERFLOW` → rebuild with new epoch; `INVALID_REJOIN_TOKEN` /
   `ROOM_CLOSED` / `ROOM_EXPIRED` → terminal.
-- `PeerConnection` accepts injectable `transportFactory` and
-  `simplePeerFactory` options so the state machine is unit-testable without a
-  browser or `wrtc`.
+- Any number of application data channels with independent ordering and
+  reliability, declared via `dataChannels` or opened at runtime. The initiator
+  creates them and the responder binds by label, so the two sides cannot
+  disagree about a channel's configuration.
+- `PeerConnection` accepts injectable `transportFactory` and `peerFactory`
+  options so the state machine is unit-testable without a browser or native
+  WebRTC.

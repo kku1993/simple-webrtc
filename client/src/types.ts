@@ -231,21 +231,12 @@ export enum ErrorCode {
 }
 
 // ---------------------------------------------------------------------------
-// Renegotiation framing over the established data channel (after the server
-// has released the sockets). See DESIGN.md "Renegotiation after socket release".
+// Peer-to-peer signal framing
+//
+// Renegotiation after the server releases the sockets travels over the engine's
+// dedicated control channel rather than the application's data channel. See
+// `src/rtc/signal.ts` for the frame format and DESIGN.md "Renegotiation after
+// socket release" for when it is used.
 // ---------------------------------------------------------------------------
 
-export interface RenegotiateFrame {
-  kind: 'renegotiate';
-  signal: SimplePeerSignalData;
-}
-
-export type DataChannelFrame = RenegotiateFrame;
-
-// Re-export the simple-peer namespace so consumers don't need a separate import
-// just to pass options through.
-import type * as SimplePeerNamespace from 'simple-peer';
-export type SimplePeer = typeof SimplePeerNamespace;
-export type SimplePeerOptions = SimplePeerNamespace.Options;
-export type SimplePeerInstance = SimplePeerNamespace.Instance;
-export type SimplePeerSignalData = SimplePeerNamespace.SignalData;
+export type { SignalData, SignalPayload } from './rtc/signal.js';

@@ -6,11 +6,12 @@
 export {
   PeerConnection,
   SignalingError,
+  DataChannelNotOpenError,
   // Re-exported types that appear in the public API:
   type PeerConnectionOptions,
-  type SimplePeerOptions,
-  type PeerLike,
-  type SimplePeerFactory,
+  type RtcOptions,
+  type RtcPeerLike,
+  type RtcPeerFactory,
   type Logger,
   type RoomState,
   type CreateRoomResult,
@@ -21,6 +22,26 @@ export {
   type PeerDestroyedReason,
   type MediaDiagnostics,
 } from './peer-connection.js';
+
+// The WebRTC engine. Most applications only need `PeerConnection`, but the
+// engine is usable standalone and its types appear in the wrapper's API.
+export {
+  RtcPeer,
+  DataChannelHandle,
+  hasWebRtcSupport,
+  parseSignalData,
+  signalFrame,
+  SIGNAL_VERSION,
+  type RtcPeerOptions,
+  type RtcPeerEvents,
+  type DataChannelSpec,
+  type DataChannelEvents,
+  type ResolvedChannelSpec,
+  type WhenClosedPolicy,
+  type ChannelDiagnostics,
+  type ChannelMessage,
+  type RtcEnv,
+} from './rtc/index.js';
 
 export {
   type RoomSession,
@@ -53,11 +74,8 @@ export {
   type RoomExpiredEvent,
   type ServerShutdownEvent,
   type ErrorResponseMessage,
-  type RenegotiateFrame,
-  type DataChannelFrame,
-  type SimplePeer,
-  type SimplePeerInstance,
-  type SimplePeerSignalData,
+  type SignalData,
+  type SignalPayload,
   CloseCode,
   ErrorCode,
 } from './types.js';
