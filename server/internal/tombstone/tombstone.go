@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kku1993/simple-peer-signal-server/internal/lru"
+	"github.com/kku1993/simple-webrtc-server/internal/lru"
 )
 
 // Reason is why a room was closed.

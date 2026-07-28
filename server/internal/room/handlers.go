@@ -4,10 +4,10 @@ import (
 	"encoding/base64"
 	"time"
 
-	"github.com/kku1993/simple-peer-signal-server/internal/protocol"
-	"github.com/kku1993/simple-peer-signal-server/internal/roomid"
-	"github.com/kku1993/simple-peer-signal-server/internal/tombstone"
-	"github.com/kku1993/simple-peer-signal-server/internal/token"
+	"github.com/kku1993/simple-webrtc-server/internal/protocol"
+	"github.com/kku1993/simple-webrtc-server/internal/roomid"
+	"github.com/kku1993/simple-webrtc-server/internal/tombstone"
+	"github.com/kku1993/simple-webrtc-server/internal/token"
 )
 
 // Result is what a handler returns to the server layer.

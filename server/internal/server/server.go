@@ -18,12 +18,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kku1993/simple-peer-signal-server/internal/config"
-	"github.com/kku1993/simple-peer-signal-server/internal/metrics"
-	"github.com/kku1993/simple-peer-signal-server/internal/protocol"
-	"github.com/kku1993/simple-peer-signal-server/internal/requestlog"
-	"github.com/kku1993/simple-peer-signal-server/internal/room"
-	"github.com/kku1993/simple-peer-signal-server/internal/turnstile"
+	"github.com/kku1993/simple-webrtc-server/internal/config"
+	"github.com/kku1993/simple-webrtc-server/internal/metrics"
+	"github.com/kku1993/simple-webrtc-server/internal/protocol"
+	"github.com/kku1993/simple-webrtc-server/internal/requestlog"
+	"github.com/kku1993/simple-webrtc-server/internal/room"
+	"github.com/kku1993/simple-webrtc-server/internal/turnstile"
 	"github.com/gorilla/websocket"
 )
 

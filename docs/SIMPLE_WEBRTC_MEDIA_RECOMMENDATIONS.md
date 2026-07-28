@@ -1,7 +1,7 @@
-# Recommendations for `simple-peer-signal` media support
+# Recommendations for `simple-webrtc` media support
 
 These recommendations come from adding optional P2P voice chat to This Game Has
-Legs using `@simple-peer-signal/client` v0.1.0. The existing library already does
+Legs using `@simple-webrtc/client` v0.1.0. The existing library already does
 two important things correctly:
 
 - It forwards `simple-peer`'s `stream` and `track` events as typed

@@ -17,13 +17,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/kku1993/simple-peer-signal-server/internal/config"
-	"github.com/kku1993/simple-peer-signal-server/internal/metrics"
-	"github.com/kku1993/simple-peer-signal-server/internal/protocol"
-	"github.com/kku1993/simple-peer-signal-server/internal/ratelimit"
-	"github.com/kku1993/simple-peer-signal-server/internal/roomid"
-	"github.com/kku1993/simple-peer-signal-server/internal/tombstone"
-	"github.com/kku1993/simple-peer-signal-server/internal/token"
+	"github.com/kku1993/simple-webrtc-server/internal/config"
+	"github.com/kku1993/simple-webrtc-server/internal/metrics"
+	"github.com/kku1993/simple-webrtc-server/internal/protocol"
+	"github.com/kku1993/simple-webrtc-server/internal/ratelimit"
+	"github.com/kku1993/simple-webrtc-server/internal/roomid"
+	"github.com/kku1993/simple-webrtc-server/internal/tombstone"
+	"github.com/kku1993/simple-webrtc-server/internal/token"
 )
 
 // Conn is the network abstraction a room uses to talk to a client. The server

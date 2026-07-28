@@ -1,5 +1,5 @@
 {
-  "name": "peer-client",
+  "name": "simple-webrtc-client",
   "version": "1.0.0",
   "description": "Zero-dependency TypeScript WebRTC client with multi-channel data support, speaking the signaling protocol in docs/DESIGN.md",
   "license": "MIT",

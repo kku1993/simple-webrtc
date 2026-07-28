@@ -1,4 +1,4 @@
-// Public entry point for the peer-client package.
+// Public entry point for the simple-webrtc-client package.
 //
 // A TypeScript client that wraps `simple-peer` and speaks the signaling
 // protocol described in `docs/DESIGN.md`. See the README for usage.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build a statically linked, CGO_ENABLED=0 Go binary for simple-peer-signal-server.
+# Build a statically linked, CGO_ENABLED=0 Go binary for simple-webrtc-server.
 #
 # Usage:
 #   scripts/build.sh              # build for the current host architecture
@@ -9,7 +9,7 @@
 #
 # The version is read from VERSION (a single "major.minor.patch" line) and
 # stamped into the binary via -ldflags "-X ...version.Version=<v>". The binary
-# is named `simple-peer-signal-server-<version>-<arch>` (e.g. simple-peer-signal-server-0.1.0-x86_64).
+# is named `simple-webrtc-server-<version>-<arch>` (e.g. simple-webrtc-server-0.1.0-x86_64).
 # The resulting binary is fully static (no libc dependency) because CGO is disabled.
 
 set -euo pipefail
@@ -127,7 +127,7 @@ fi
 
 mkdir -p "${output_dir}"
 
-binary_name="simple-peer-signal-server-${version}-${arch}"
+binary_name="simple-webrtc-server-${version}-${arch}"
 output_path="${output_dir}/${binary_name}"
 
 echo "Building ${binary_name} (GOOS=linux GOARCH=${goarch}, CGO_ENABLED=0, static)..."
@@ -139,7 +139,7 @@ echo "  output:  ${output_path}"
 # reproducible builds and strip the symbol table / DWARF table to shrink the
 # resulting artifact. The version is stamped into the version package via
 # -X so `--version` and the startup log line report it.
-version_pkg="github.com/kku1993/simple-peer-signal-server/internal/version"
+version_pkg="github.com/kku1993/simple-webrtc-server/internal/version"
 
 export CGO_ENABLED=0
 export GOOS=linux

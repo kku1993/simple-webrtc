@@ -15,15 +15,15 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/kku1993/simple-peer-signal-server/internal/config"
-	"github.com/kku1993/simple-peer-signal-server/internal/metrics"
-	"github.com/kku1993/simple-peer-signal-server/internal/requestlog"
-	"github.com/kku1993/simple-peer-signal-server/internal/room"
-	"github.com/kku1993/simple-peer-signal-server/internal/server"
-	"github.com/kku1993/simple-peer-signal-server/internal/token"
-	"github.com/kku1993/simple-peer-signal-server/internal/tombstone"
-	"github.com/kku1993/simple-peer-signal-server/internal/turnstile"
-	"github.com/kku1993/simple-peer-signal-server/internal/version"
+	"github.com/kku1993/simple-webrtc-server/internal/config"
+	"github.com/kku1993/simple-webrtc-server/internal/metrics"
+	"github.com/kku1993/simple-webrtc-server/internal/requestlog"
+	"github.com/kku1993/simple-webrtc-server/internal/room"
+	"github.com/kku1993/simple-webrtc-server/internal/server"
+	"github.com/kku1993/simple-webrtc-server/internal/token"
+	"github.com/kku1993/simple-webrtc-server/internal/tombstone"
+	"github.com/kku1993/simple-webrtc-server/internal/turnstile"
+	"github.com/kku1993/simple-webrtc-server/internal/version"
 )
 
 func main() {
@@ -48,7 +48,7 @@ func run() error {
 		return err
 	}
 
-	log.Printf("simple-peer-signal-server %s starting on %s", version.Version, cfg.ListenAddr)
+	log.Printf("simple-webrtc-server %s starting on %s", version.Version, cfg.ListenAddr)
 
 	if cfg.OriginsCheckDisabled() {
 		log.Printf("WARNING: ALLOWED_ORIGINS is \"*\"; origin checking is disabled")

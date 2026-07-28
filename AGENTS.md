@@ -1,4 +1,4 @@
-# simple-peer-signal
+# simple-webrtc
 
 Go implementation of the signaling server and typescript implementation of the
 client in `docs/DESIGN.md`.

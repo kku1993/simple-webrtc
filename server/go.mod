@@ -1,4 +1,4 @@
-module github.com/kku1993/simple-peer-signal-server
+module github.com/kku1993/simple-webrtc-server
 
 go 1.25.5
 

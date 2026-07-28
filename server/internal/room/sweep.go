@@ -4,7 +4,7 @@ import (
 	"crypto/rand"
 	"time"
 
-	"github.com/kku1993/simple-peer-signal-server/internal/protocol"
+	"github.com/kku1993/simple-webrtc-server/internal/protocol"
 )
 
 // StartSweep launches the background timer goroutine that drives peer

@@ -7,11 +7,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kku1993/simple-peer-signal-server/internal/config"
-	"github.com/kku1993/simple-peer-signal-server/internal/metrics"
-	"github.com/kku1993/simple-peer-signal-server/internal/protocol"
-	"github.com/kku1993/simple-peer-signal-server/internal/tombstone"
-	"github.com/kku1993/simple-peer-signal-server/internal/token"
+	"github.com/kku1993/simple-webrtc-server/internal/config"
+	"github.com/kku1993/simple-webrtc-server/internal/metrics"
+	"github.com/kku1993/simple-webrtc-server/internal/protocol"
+	"github.com/kku1993/simple-webrtc-server/internal/tombstone"
+	"github.com/kku1993/simple-webrtc-server/internal/token"
 )
 
 // fakeConn is a recording room.Conn used to drive the registry in tests.

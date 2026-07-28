@@ -11,12 +11,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kku1993/simple-peer-signal-server/internal/config"
-	"github.com/kku1993/simple-peer-signal-server/internal/metrics"
-	"github.com/kku1993/simple-peer-signal-server/internal/requestlog"
-	"github.com/kku1993/simple-peer-signal-server/internal/room"
-	"github.com/kku1993/simple-peer-signal-server/internal/tombstone"
-	"github.com/kku1993/simple-peer-signal-server/internal/token"
+	"github.com/kku1993/simple-webrtc-server/internal/config"
+	"github.com/kku1993/simple-webrtc-server/internal/metrics"
+	"github.com/kku1993/simple-webrtc-server/internal/requestlog"
+	"github.com/kku1993/simple-webrtc-server/internal/room"
+	"github.com/kku1993/simple-webrtc-server/internal/tombstone"
+	"github.com/kku1993/simple-webrtc-server/internal/token"
 	"github.com/gorilla/websocket"
 )
 

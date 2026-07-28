@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Build the TypeScript client and pack it into an npm tarball.
 #
-# The tarball is written to dist/ (e.g. dist/simple-peer-signal-client-0.1.0.tgz)
+# The tarball is written to dist/ (e.g. dist/simple-webrtc-client-0.1.0.tgz)
 # and can be attached to a GitHub release manually, or installed directly with:
 #
-#   npm install ./dist/simple-peer-signal-client-0.1.0.tgz
+#   npm install ./dist/simple-webrtc-client-0.1.0.tgz
 #
 # Usage:
 #   scripts/release-client.sh              # build + pack to dist/
@@ -86,7 +86,7 @@ if ! [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.][0-9A-Za-z.-]+)?$ ]]; then
     exit 1
 fi
 
-echo "Releasing @simple-peer-signal/client ${version}"
+echo "Releasing @simple-webrtc/client ${version}"
 echo "  repo root:  ${REPO_ROOT}"
 echo "  client dir: ${CLIENT_DIR}"
 echo "  output:     ${output_dir}"

@@ -1,4 +1,4 @@
-# simple-peer-signal
+# simple-webrtc
 
 Backend server (golang) and corresponding client library (typescript) for
 peer-to-peer WebRTC: media, plus any number of ordered and unordered data
@@ -12,7 +12,7 @@ reference. This README covers getting both sides running end-to-end.
 ## Quickstart
 
 Both the server binary and the client library are distributed as artifacts
-attached to [GitHub releases](https://github.com/kku1993/simple-peer-signal/releases),
+attached to [GitHub releases](https://github.com/kku1993/simple-webrtc/releases),
 tagged after the repo-root `VERSION` file (e.g. `v0.1.0`).
 
 ### 1. Run the signaling server
@@ -23,9 +23,9 @@ Download the prebuilt binary for your architecture from the latest release
 ```sh
 VERSION=0.1.0
 ARCH=x86_64   # or arm64
-curl -L -o simple-peer-signal-server \
-  https://github.com/kku1993/simple-peer-signal/releases/download/v${VERSION}/simple-peer-signal-server-${VERSION}-${ARCH}
-chmod +x simple-peer-signal-server
+curl -L -o simple-webrtc-server \
+  https://github.com/kku1993/simple-webrtc/releases/download/v${VERSION}/simple-webrtc-server-${VERSION}-${ARCH}
+chmod +x simple-webrtc-server
 ```
 
 The server requires a `SERVER_SECRET` (>=32 bytes), an `ALLOWED_ORIGINS`
@@ -37,7 +37,7 @@ SERVER_SECRET="$(openssl rand -base64 32)" \
 ALLOWED_ORIGINS="http://localhost:5173,https://your.app" \
 SHARD_NAME="t" \
 LISTEN_ADDR=":8080" \
-./simple-peer-signal-server
+./simple-webrtc-server
 ```
 
 Health and Prometheus metrics are served alongside the WebSocket endpoint:
@@ -53,11 +53,11 @@ peer deadline, Cloudflare Turnstile, etc.).
 
 ### 2. Set up the client
 
-The client ships as the `@simple-peer-signal/client` npm package, distributed
+The client ships as the `@simple-webrtc/client` npm package, distributed
 as a tarball attached to the same GitHub release. Install it in your project:
 
 ```sh
-npm install https://github.com/kku1993/simple-peer-signal/releases/download/v0.1.0/simple-peer-signal-client-0.1.0.tgz
+npm install https://github.com/kku1993/simple-webrtc/releases/download/v0.1.0/simple-webrtc-client-0.1.0.tgz
 ```
 
 One `PeerConnection` represents one room pairing. The host creates a room,
@@ -65,7 +65,7 @@ the guest joins it, and the client handles signaling, reconnection, and
 renegotiation automatically.
 
 ```ts
-import { PeerConnection, BrowserSessionStore } from "@simple-peer-signal/client";
+import { PeerConnection, BrowserSessionStore } from "@simple-webrtc/client";
 
 // Host side
 const host = new PeerConnection({
@@ -169,7 +169,7 @@ never need to know whether the underlying peer currently exists.
 ### Audio-only chat (after a button click)
 
 ```ts
-import { PeerConnection, BrowserSessionStore } from "@simple-peer-signal/client";
+import { PeerConnection, BrowserSessionStore } from "@simple-webrtc/client";
 
 const host = new PeerConnection({
   url: "wss://signal.example/v1/signal",
@@ -421,15 +421,15 @@ prefer the wrapper-level media and channel methods for ordinary use.
 ## Repository layout
 
 - `server/` — Go signaling server (`cmd/server` entry point, `internal/*` packages).
-- `client/` — TypeScript source for `@simple-peer-signal/client` (includes `src/rtc/`, the WebRTC engine).
-- `package.json` — root package face for `@simple-peer-signal/client` (installed via GitHub release tarballs).
+- `client/` — TypeScript source for `@simple-webrtc/client` (includes `src/rtc/`, the WebRTC engine).
+- `package.json` — root package face for `@simple-webrtc/client` (installed via GitHub release tarballs).
 - `scripts/` — `build.sh` (Go server binary), `release-client.sh` (client release tarball).
 - `docs/DESIGN.md` — protocol, state machine, and configuration reference.
 
 ## Building from source
 
 Prebuilt artifacts are published on the
-[releases page](https://github.com/kku1993/simple-peer-signal/releases).
+[releases page](https://github.com/kku1993/simple-webrtc/releases).
 The instructions below are only needed for local development or cutting a new
 release.
 
@@ -466,7 +466,7 @@ npm run build                         # emits ESM + .d.ts to dist/
 `RTCPeerConnection`, so no browser or native WebRTC is needed.
 
 To build a release tarball (version read from the repo-root `VERSION` file,
-written to `dist/simple-peer-signal-client-<version>.tgz`):
+written to `dist/simple-webrtc-client-<version>.tgz`):
 
 ```sh
 scripts/release-client.sh             # build + pack to dist/

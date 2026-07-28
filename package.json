@@ -1,5 +1,5 @@
 {
-  "name": "@simple-peer-signal/client",
+  "name": "@simple-webrtc/client",
   "version": "0.4.0",
   "description": "Zero-dependency TypeScript WebRTC client with media and multi-channel data support, speaking the signaling protocol in docs/DESIGN.md",
   "license": "MIT",

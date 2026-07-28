@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/kku1993/simple-peer-signal-server/internal/lru"
+	"github.com/kku1993/simple-webrtc-server/internal/lru"
 )
 
 // Bucket is a token bucket. It is not safe for concurrent use by itself; the

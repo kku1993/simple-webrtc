@@ -9,5 +9,5 @@
 package version
 
 // Version is the server version string. It is overridden at link time via
-// -ldflags "-X github.com/kku1993/simple-peer-signal-server/internal/version.Version=<v>".
+// -ldflags "-X github.com/kku1993/simple-webrtc-server/internal/version.Version=<v>".
 var Version = "dev"

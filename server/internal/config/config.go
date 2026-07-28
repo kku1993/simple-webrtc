@@ -13,7 +13,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/kku1993/simple-peer-signal-server/internal/roomid"
+	"github.com/kku1993/simple-webrtc-server/internal/roomid"
 )
 
 // Config is the validated server configuration.

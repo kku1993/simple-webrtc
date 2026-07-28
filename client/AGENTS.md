@@ -1,4 +1,4 @@
-# AGENTS.md — peer-client
+# AGENTS.md — simple-webrtc-client
 
 Zero-dependency TypeScript WebRTC client speaking the signaling protocol in
 `docs/DESIGN.md`. Source lives in `client/src/`, tests in `client/test/`.
