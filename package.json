@@ -1,6 +1,6 @@
 {
   "name": "@simple-webrtc/client",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Zero-dependency TypeScript WebRTC client with media and multi-channel data support, speaking the signaling protocol in docs/DESIGN.md",
   "license": "MIT",
   "type": "module",
