@@ -241,7 +241,9 @@ export interface PeerConnectionEvents {
   /**
    * An internal peer generation was destroyed (peer rebuild, close, or terminal
    * error). `reason` is one of `'rebuild'`, `'close'`, `'user-close'`,
-   * `'terminal'`.
+   * `'terminal'`. Emitted exactly once per generation: a deliberate teardown
+   * reports the reason it was torn down for, and `'close'` means the P2P
+   * connection died on its own.
    */
   'peer-destroyed': { generation: number; reason: PeerDestroyedReason };
   /** The other side's socket dropped (P2P may survive). */
@@ -1143,6 +1145,19 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
     peer.on('channel-error', (e) => this.emit('channel-error', e));
     peer.on('channel', (e) => this.emit('channel', e));
     peer.on('close', () => {
+      if (this.peer !== peer) {
+        // We are no longer the current generation. Either `destroyPeer()` is
+        // tearing this peer down on purpose (it clears `this.peer` before
+        // calling `destroy()`, and emits `peer-destroyed` with the real
+        // reason itself), or a rebuild already installed a replacement. Either
+        // way this close is not "the P2P connection died", so it must not
+        // schedule a reconnect: the socket is typically still attached, and
+        // the resulting `rejoin-room` is rejected by the server with 1004
+        // "connection already attached" (close 4001), killing a healthy
+        // signaling socket.
+        this.log.debug?.('ignoring close from superseded peer');
+        return;
+      }
       this.log.info?.('peer close');
       const generation = this.peerGenerationField;
       this.peer = null;

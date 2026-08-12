@@ -345,6 +345,71 @@ test('peer-reset event rebuilds the SimplePeer', async () => {
   conn.destroy();
 });
 
+test('peer-reset rebuild does not schedule a reconnect on the attached socket', async () => {
+  const h = createFakeHarness();
+  const conn = makeConn(h);
+
+  const destroyed: { generation: number; reason: string }[] = [];
+  conn.on('peer-destroyed', (e) => destroyed.push(e));
+
+  const created = conn.createRoom();
+  await waitForMessage(h, 'create-room');
+  h.ws.receiveMessage(createRoomResponse('room-5c', 'tok-host', 'host-epoch-5c'));
+  await created;
+  h.ws.receiveMessage({ type: 'guest-joined', guestEpoch: 'guest-epoch-5c' });
+  await flush();
+  (h.peers[0] as FakePeer).emitConnect();
+  await flush();
+  assert.equal(conn.currentStatus, 'connected');
+
+  // The other side reattached with a new epoch. Destroying our peer to rebuild
+  // makes it emit `close`, which must NOT be mistaken for "the P2P connection
+  // died": our signaling socket is still attached, so the rejoin-room it would
+  // schedule is rejected by the server with 1004 / close 4001.
+  h.ws.receiveMessage({ type: 'peer-reset', role: 'guest', epoch: 'guest-epoch-5c-NEW' });
+  await flush();
+
+  assert.equal(conn.currentStatus, 'signaling');
+  assert.equal(h.peers.length, 2);
+  assert.equal((h.peers[1] as FakePeer).destroyed, false);
+  // Exactly one peer-destroyed, carrying the real reason (not 'close').
+  assert.deepEqual(destroyed, [{ generation: 1, reason: 'rebuild' }]);
+
+  // Give the reconnect backoff (attempt 0, < 500ms) time to fire.
+  await new Promise((r) => setTimeout(r, 700));
+  assert.equal(lastOf(h, 'rejoin-room'), undefined);
+  assert.equal(conn.currentStatus, 'signaling');
+  conn.destroy();
+});
+
+test('peer dying on its own still triggers a reconnect', async () => {
+  const h = createFakeHarness();
+  const conn = makeConn(h);
+
+  const destroyed: { generation: number; reason: string }[] = [];
+  conn.on('peer-destroyed', (e) => destroyed.push(e));
+
+  const created = conn.createRoom();
+  await waitForMessage(h, 'create-room');
+  h.ws.receiveMessage(createRoomResponse('room-5d', 'tok-host-5d', 'host-epoch-5d'));
+  await created;
+  h.ws.receiveMessage({ type: 'guest-joined', guestEpoch: 'guest-epoch-5d' });
+  await flush();
+  const peer = h.peers[0] as FakePeer;
+  peer.emitConnect();
+  await flush();
+
+  // ICE failure: the peer closes without anyone asking it to.
+  peer.emitClose();
+  await flush();
+
+  assert.deepEqual(destroyed, [{ generation: 1, reason: 'close' }]);
+  assert.equal(conn.currentStatus, 'reconnecting');
+  const rejoin = await waitForMessage(h, 'rejoin-room', 2000);
+  assert.equal(rejoin['rejoinToken'], 'tok-host-5d');
+  conn.destroy();
+});
+
 test('reconnect: retryable close triggers a rejoin-room with a fresh epoch', async () => {
   const h = createFakeHarness();
   const conn = makeConn(h);

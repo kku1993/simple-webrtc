@@ -164,8 +164,13 @@ export class FakePeer implements RtcPeerLike {
     return Promise.resolve(new Map() as unknown as RTCStatsReport);
   }
 
-  destroy(_error?: Error): void {
+  /** Mirrors `RtcPeer.destroy`: idempotent, and emits `close` synchronously. */
+  destroy(error?: Error): void {
+    if (this.destroyed) return;
     this.destroyed = true;
+    this.connected = false;
+    if (error) this.fire('error', error);
+    this.fire('close');
   }
 
   addTrack(track: MediaStreamTrack, stream: MediaStream): void {
@@ -220,9 +225,9 @@ export class FakePeer implements RtcPeerLike {
     this.fire('data', chunk);
   }
 
+  /** Simulate the peer dying on its own (ICE failure, remote close). */
   emitClose(): void {
-    this.connected = false;
-    this.fire('close');
+    this.destroy();
   }
 
   emitError(err: Error): void {
