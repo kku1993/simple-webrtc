@@ -410,6 +410,46 @@ test('peer dying on its own still triggers a reconnect', async () => {
   conn.destroy();
 });
 
+test('a rejoin rejected as "already attached" does not tear down the session', async () => {
+  const h = createFakeHarness();
+  const conn = makeConn(h);
+  const rec = record(conn);
+
+  const destroyed: { generation: number; reason: string }[] = [];
+  conn.on('peer-destroyed', (e) => destroyed.push(e));
+
+  const created = conn.createRoom();
+  await waitForMessage(h, 'create-room');
+  h.ws.receiveMessage(createRoomResponse('room-5e', 'tok-host-5e', 'host-epoch-5e'));
+  await created;
+  h.ws.receiveMessage({ type: 'guest-joined', guestEpoch: 'guest-epoch-5e' });
+  await flush();
+  const peer = h.peers[0] as FakePeer;
+  peer.emitConnect();
+  await flush();
+
+  // Force a rejoin on a socket that is still attached, then have the server
+  // answer the way it now does: a non-fatal UNEXPECTED_STATE, no close.
+  peer.emitClose();
+  const rejoin = await waitForMessage(h, 'rejoin-room', 2000);
+  h.ws.receiveMessage({
+    type: 'error-response',
+    requestId: rejoin['requestId'] as string,
+    errorCode: ErrorCode.UNEXPECTED_STATE,
+    message: 'connection already attached',
+    retryable: false,
+  });
+  await flush();
+
+  // The session survives: no terminal error, no close, socket still open.
+  assert.equal(conn.currentStatus, 'waiting-for-peer');
+  assert.ok(!rec.events.some((e) => e.event === 'error'));
+  assert.ok(!rec.events.some((e) => e.event === 'close'));
+  assert.equal(h.ws.readyState, 1); // still OPEN
+  assert.deepEqual(destroyed, [{ generation: 1, reason: 'close' }]);
+  conn.destroy();
+});
+
 test('reconnect: retryable close triggers a rejoin-room with a fresh epoch', async () => {
   const h = createFakeHarness();
   const conn = makeConn(h);

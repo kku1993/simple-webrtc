@@ -725,17 +725,38 @@ func TestSignalBufferOverflow(t *testing.T) {
 	}
 }
 
+// A second handshake on an attached connection is answered with
+// UNEXPECTED_STATE but must NOT close the connection: the socket is healthy and
+// still attached, and closing it would break a working session.
 func TestUnexpectedStateOnSecondHandshake(t *testing.T) {
 	r, _ := testRegistry(t)
 	host := NewSession(newFakeConn("1.1.1.1"))
 	r.CreateRoom(host, protocol.CreateRoomMsg{Type: protocol.TypeCreateRoom, HostEpoch: "h"}, true)
-	// Already attached; a second create-room should be UNEXPECTED_STATE.
-	res := r.CreateRoom(host, protocol.CreateRoomMsg{Type: protocol.TypeCreateRoom, HostEpoch: "h2"}, true)
-	if !isErr(mapOf(res.Response), int(protocol.ErrUnexpectedState)) {
-		t.Errorf("expected UNEXPECTED_STATE, got %v", res.Response)
+	roomID := getRoomID(t, r)
+
+	cases := map[string]Result{
+		"create-room": r.CreateRoom(host, protocol.CreateRoomMsg{Type: protocol.TypeCreateRoom, HostEpoch: "h2"}, true),
+		"join-room":   r.JoinRoom(host, protocol.JoinRoomMsg{Type: protocol.TypeJoinRoom, RoomID: roomID, GuestEpoch: "g"}),
+		"rejoin-room": r.RejoinRoom(host, protocol.RejoinRoomMsg{Type: protocol.TypeRejoinRoom, RejoinToken: "tok", Epoch: "h3"}),
 	}
-	if res.CloseCode == nil || *res.CloseCode != int(protocol.CloseProtocolError) {
-		t.Errorf("expected close 4001, got %v", res.CloseCode)
+	for name, res := range cases {
+		if !isErr(mapOf(res.Response), int(protocol.ErrUnexpectedState)) {
+			t.Errorf("%s: expected UNEXPECTED_STATE, got %v", name, res.Response)
+		}
+		if res.CloseCode != nil {
+			t.Errorf("%s: expected no close code, got %v", name, *res.CloseCode)
+		}
+	}
+
+	// The rejected handshakes left the session attached and usable.
+	if !host.attached || host.role != protocol.RoleHost {
+		t.Fatalf("session detached by a rejected handshake: attached=%v role=%v", host.attached, host.role)
+	}
+	if got := getRoomID(t, r); got != roomID {
+		t.Errorf("room id changed: %q -> %q", roomID, got)
+	}
+	if res := r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 1, Data: "a"}); res.CloseCode != nil {
+		t.Errorf("signaling broken after rejected handshake: close %v", *res.CloseCode)
 	}
 }
 

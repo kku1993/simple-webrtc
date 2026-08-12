@@ -167,7 +167,13 @@ that has not been attached to a room slot holds no room state and must not be
 allowed to linger.
 
 Sending a second handshake message on an already-attached connection is
-`UNEXPECTED_STATE`.
+`UNEXPECTED_STATE` ("connection already attached"). This is **not** fatal: the
+server answers with an `error-response` and leaves the connection attached and
+usable, mutating no room state. A connection in this state is a healthy
+signaling socket whose client sent one handshake too many — a race, or a client
+bug — and closing it would escalate a harmless redundant message into a real
+outage, dropping an in-flight ICE exchange or tearing down an established P2P
+session. The redundant handshake is ignored; the existing attachment stands.
 
 ## Message envelope
 
@@ -905,7 +911,7 @@ clients.
 | 1001 | `MALFORMED_MESSAGE` | no | Client bug. Surface to developer |
 | 1002 | `UNKNOWN_MESSAGE_TYPE` | no | Client bug or version skew |
 | 1003 | `PAYLOAD_TOO_LARGE` | no | Client bug |
-| 1004 | `UNEXPECTED_STATE` | no | e.g. `signal` before attaching to a room |
+| 1004 | `UNEXPECTED_STATE` | no | e.g. `signal` before attaching to a room, or a handshake on an already-attached connection. Never closes the connection — the client should keep using it, not tear down the session |
 | 1005 | `HANDSHAKE_TIMEOUT` | yes | Reconnect and send the handshake promptly |
 | 1101 | `ROOM_NOT_FOUND` | yes | Guest, first join: backoff retry up to 30 s (the host may be recreating after a restart), then surface. Host: create a new room |
 | 1103 | `ROOM_FULL` | no | Surface to user. Only a rejoin token can displace an occupant |

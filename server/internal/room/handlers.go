@@ -40,6 +40,21 @@ func fatalErrResult(closeCode int, code protocol.ErrorCode, msg, requestID strin
 	}
 }
 
+// alreadyAttachedResult rejects a handshake sent on a connection that is
+// already attached to a room.
+//
+// This is deliberately NOT fatal. A connection in this state is a healthy,
+// attached signaling socket: the client sent one handshake too many (a race,
+// or a bug like a peer rebuild being mistaken for a dead connection), but
+// nothing about the room or the socket is broken. Closing it would turn a
+// harmless redundant message into a real outage — dropping an in-flight ICE
+// exchange, or tearing down an established P2P session. We answer with an
+// error-response and leave the connection attached and usable; the existing
+// attachment stands and no room state is mutated.
+func alreadyAttachedResult(requestID string) Result {
+	return errResult(protocol.ErrUnexpectedState, "connection already attached", requestID, nil)
+}
+
 func msPtr(d time.Duration) *int {
 	ms := int(d.Milliseconds())
 	if ms <= 0 {
@@ -51,8 +66,7 @@ func msPtr(d time.Duration) *int {
 // CreateRoom handles a create-room message.
 func (r *Registry) CreateRoom(s *Session, m protocol.CreateRoomMsg, turnstileOK bool) Result {
 	if s.attached {
-		return fatalErrResult(int(protocol.CloseProtocolError), protocol.ErrUnexpectedState,
-			"connection already attached", m.RequestID, nil)
+		return alreadyAttachedResult(m.RequestID)
 	}
 	if m.HostEpoch == "" || len(m.HostEpoch) > MaxEpochLen {
 		return errResult(protocol.ErrMalformedMessage, "hostEpoch required (max 64 chars)", m.RequestID, nil)
@@ -168,8 +182,7 @@ func (r *Registry) CreateRoom(s *Session, m protocol.CreateRoomMsg, turnstileOK 
 // JoinRoom handles a join-room message.
 func (r *Registry) JoinRoom(s *Session, m protocol.JoinRoomMsg) Result {
 	if s.attached {
-		return fatalErrResult(int(protocol.CloseProtocolError), protocol.ErrUnexpectedState,
-			"connection already attached", m.RequestID, nil)
+		return alreadyAttachedResult(m.RequestID)
 	}
 	if m.RoomID == "" || len(m.RoomID) > MaxRoomIDLen {
 		return errResult(protocol.ErrMalformedMessage, "roomId required (max 64 chars)", m.RequestID, nil)
@@ -280,8 +293,7 @@ func (r *Registry) JoinRoom(s *Session, m protocol.JoinRoomMsg) Result {
 // order from docs/DESIGN.md §"RejoinRoom".
 func (r *Registry) RejoinRoom(s *Session, m protocol.RejoinRoomMsg) Result {
 	if s.attached {
-		return fatalErrResult(int(protocol.CloseProtocolError), protocol.ErrUnexpectedState,
-			"connection already attached", m.RequestID, nil)
+		return alreadyAttachedResult(m.RequestID)
 	}
 	if m.RejoinToken == "" {
 		return errResult(protocol.ErrInvalidRejoinToken, "missing token", m.RequestID, nil)

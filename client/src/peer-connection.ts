@@ -1478,6 +1478,18 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
         this.failTerminal(err, err.message);
         return;
       }
+      if (err.code === 1004 /* UNEXPECTED_STATE — "connection already attached" */) {
+        // This rejoin was redundant: the socket it was sent on is still
+        // attached to the room, so there is nothing to recover. The server
+        // answers non-fatally and leaves the connection attached, so recover
+        // in place rather than tearing down a healthy session.
+        this.log.warn?.('rejoin rejected: connection already attached');
+        this.reconnectAttempt = 0;
+        this.setStatus(
+          this.peer?.connected ? 'connected' : this.peer ? 'signaling' : 'waiting-for-peer',
+        );
+        return;
+      }
       if (!err.retryable) {
         this.failTerminal(err, err.message);
         return;
