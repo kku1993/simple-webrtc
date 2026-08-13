@@ -144,3 +144,11 @@ IMAGE=signal-base ./run.sh -mode hold -rooms 10000 -ramp 40s -hold 30s
 - **Peak RSS is the cgroup's, not the heap's.** It includes kernel socket
   buffers charged to the container, which is the number that decides whether
   the process is OOM-killed.
+- **CPU differences smaller than a few points need paired runs.** A single run
+  varies by ±3 points of a core between repeats, so an A/B has to alternate the
+  two images over several rounds and compare within each round — and normalize
+  by `signal_signals_relayed_total`, since the generator does not always
+  deliver the same offered load. For anything narrower than that, measure the
+  code path directly: `go test ./internal/room/ -bench SignalRelay -count 6`
+  in `../server` isolates one relayed signal, and `benchstat` will resolve a
+  few percent where a container run cannot.

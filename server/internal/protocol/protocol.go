@@ -5,7 +5,10 @@
 // field. This package mirrors the message tables in docs/DESIGN.md.
 package protocol
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"strconv"
+)
 
 // Role identifies a slot within a room.
 type Role string
@@ -143,11 +146,27 @@ type RejoinRoomMsg struct {
 }
 
 // SignalMsg is the client→server signal message.
+//
+// Data is kept as the raw JSON token the client sent — a quoted string — and
+// is never decoded. The server treats the signaling payload as opaque, so
+// unquoting it on the way in only to re-quote it on the way out is pure cost,
+// and it is the largest field in the message: clients send
+// `JSON.stringify(sdp)`, so nearly every byte of it is an escaped quote. See
+// AppendSignalResponse.
 type SignalMsg struct {
-	Type      string `json:"type"`
-	RequestID string `json:"requestId,omitempty"`
-	Seq       int    `json:"seq"`
-	Data      string `json:"data"`
+	Type      string          `json:"type"`
+	RequestID string          `json:"requestId,omitempty"`
+	Seq       int             `json:"seq"`
+	Data      json.RawMessage `json:"data"`
+}
+
+// IsJSONString reports whether raw is a JSON string token. Decoding into a
+// json.RawMessage accepts any JSON value, so the type check that
+// `Data string` used to get from the decoder has to be made explicitly.
+// An absent field (nil) is not a string; callers decide whether that is an
+// error or an empty payload.
+func IsJSONString(raw json.RawMessage) bool {
+	return len(raw) > 0 && raw[0] == '"'
 }
 
 // PeerConnectedMsg is the client→server peer-connected message.
@@ -207,13 +226,71 @@ type RejoinRoomResponse struct {
 	RejoinTokenExpiresAt    string  `json:"rejoinTokenExpiresAt"`
 }
 
+// SignalResponse documents the server→client signal-response shape. It is not
+// used to encode one: AppendSignalResponse writes the same JSON directly so
+// the payload can be relayed without a decode/re-encode round trip. Keep the
+// two in sync — the field order here is the field order on the wire.
 type SignalResponse struct {
-	Type        string `json:"type"`
-	FromRole    Role   `json:"fromRole"`
-	FromEpoch   string `json:"fromEpoch"`
-	Seq         int    `json:"seq"`
-	Data        string `json:"data"`
-	ReceivedAt  string `json:"receivedAt"`
+	Type       string `json:"type"`
+	FromRole   Role   `json:"fromRole"`
+	FromEpoch  string `json:"fromEpoch"`
+	Seq        int    `json:"seq"`
+	Data       string `json:"data"`
+	ReceivedAt string `json:"receivedAt"`
+}
+
+// AppendSignalResponse appends a signal-response message to dst and returns
+// the extended slice.
+//
+// data is the `data` token exactly as it arrived from the sender and is
+// spliced in verbatim, which is the whole point: it is already a valid JSON
+// string, so copying it is enough. Callers must have checked it with
+// IsJSONString; a nil data is written as an empty string, matching what a
+// missing field used to decode to.
+//
+// The output is byte-identical to json.Marshal of the equivalent
+// SignalResponse for any data the sender could have produced, including its
+// escaping of <, > and & — appendJSONString mirrors encoding/json.
+func AppendSignalResponse(dst []byte, fromRole Role, fromEpoch string, seq int, data json.RawMessage, receivedAt string) []byte {
+	dst = append(dst, `{"type":"`...)
+	dst = append(dst, TypeSignalResponse...)
+	dst = append(dst, `","fromRole":`...)
+	dst = appendJSONString(dst, string(fromRole))
+	dst = append(dst, `,"fromEpoch":`...)
+	dst = appendJSONString(dst, fromEpoch)
+	dst = append(dst, `,"seq":`...)
+	dst = strconv.AppendInt(dst, int64(seq), 10)
+	dst = append(dst, `,"data":`...)
+	if len(data) == 0 {
+		dst = append(dst, `""`...)
+	} else {
+		dst = append(dst, data...)
+	}
+	dst = append(dst, `,"receivedAt":`...)
+	dst = appendJSONString(dst, receivedAt)
+	return append(dst, '}')
+}
+
+// appendJSONString appends s as a JSON string literal, escaping exactly what
+// encoding/json escapes with its default HTML-escaping encoder. Anything
+// outside plain printable ASCII goes through encoding/json itself rather than
+// being reimplemented here: the fields this is used for (roles, epochs,
+// timestamps) are ASCII in every non-adversarial case, and correctness matters
+// more than the speed of the exception.
+func appendJSONString(dst []byte, s string) []byte {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c < 0x20 || c > 0x7e || c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' {
+			b, err := json.Marshal(s)
+			if err != nil {
+				return append(dst, `""`...)
+			}
+			return append(dst, b...)
+		}
+	}
+	dst = append(dst, '"')
+	dst = append(dst, s...)
+	return append(dst, '"')
 }
 
 type GuestJoinedEvent struct {

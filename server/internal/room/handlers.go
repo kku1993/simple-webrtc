@@ -443,14 +443,7 @@ func (r *Registry) RejoinRoom(s *Session, m protocol.RejoinRoomMsg) Result {
 	// Replay buffered signals to the rejoining slot if epoch unchanged.
 	if !epochChanged && len(mySlot.buffer) > 0 {
 		for _, bs := range mySlot.buffer {
-			send(mySlot.conn, protocol.SignalResponse{
-				Type:       protocol.TypeSignalResponse,
-				FromRole:   bs.FromRole,
-				FromEpoch:  bs.FromEpoch,
-				Seq:        bs.Seq,
-				Data:       bs.Data,
-				ReceivedAt: isoTime(bs.ReceivedAt),
-			})
+			sendSignal(mySlot.conn, bs.FromRole, bs.FromEpoch, bs.Seq, bs.Data, bs.ReceivedAt)
 		}
 	}
 
@@ -488,6 +481,11 @@ func (r *Registry) Signal(s *Session, m protocol.SignalMsg) Result {
 	if m.Seq <= 0 {
 		return errResult(protocol.ErrMalformedMessage, "seq must be positive", m.RequestID, nil)
 	}
+	// Data is relayed as the raw JSON token it arrived as, so the "is it a
+	// string?" check the decoder used to make has to be made here.
+	if len(m.Data) > 0 && !protocol.IsJSONString(m.Data) {
+		return errResult(protocol.ErrMalformedMessage, "data must be a string", m.RequestID, nil)
+	}
 
 	s.mu.Lock()
 	room := s.room
@@ -509,18 +507,13 @@ func (r *Registry) Signal(s *Session, m protocol.SignalMsg) Result {
 
 	now := r.now()
 	r.metrics.SignalsRelayed.Inc()
+	// len(m.Data) is the encoded token, quotes and escapes included, which is
+	// what the payload costs on the wire and in the buffer. It runs a little
+	// above the decoded length it counted back when the payload was decoded.
 	r.metrics.BytesRelayed.Add(float64(len(m.Data)))
 
 	if otherSlot.conn != nil {
-		ok := send(otherSlot.conn, protocol.SignalResponse{
-			Type:       protocol.TypeSignalResponse,
-			FromRole:   role,
-			FromEpoch:  mySlot.epoch,
-			Seq:        m.Seq,
-			Data:       m.Data,
-			ReceivedAt: isoTime(now),
-		})
-		_ = ok
+		sendSignal(otherSlot.conn, role, mySlot.epoch, m.Seq, m.Data, now)
 		return Result{}
 	}
 

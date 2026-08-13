@@ -77,14 +77,14 @@ func (c *fakeConn) isClosed() bool {
 
 // --- helpers ---
 
-func testRegistry(t *testing.T) (*Registry, *token.Signer) {
+func testRegistry(t testing.TB) (*Registry, *token.Signer) {
 	t.Helper()
 	return testRegistryWith(t, nil)
 }
 
 // testRegistryWith constructs a registry, applying mutate to the config before
 // any rate-limiter or counter map is built.
-func testRegistryWith(t *testing.T, mutate func(*config.Config)) (*Registry, *token.Signer) {
+func testRegistryWith(t testing.TB, mutate func(*config.Config)) (*Registry, *token.Signer) {
 	t.Helper()
 	cfg := config.Config{
 		ListenAddr:                    ":0",
@@ -395,7 +395,7 @@ func TestSignalRelay(t *testing.T) {
 	r.JoinRoom(guest, protocol.JoinRoomMsg{Type: protocol.TypeJoinRoom, RoomID: roomID, GuestEpoch: "g"})
 
 	// Host sends a signal; guest should receive it.
-	r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 1, Data: `{"s":"offer"}`})
+	r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 1, Data: sigData(`{"s":"offer"}`)})
 	last := fc(guest).last()
 	if last["type"] != protocol.TypeSignalResponse {
 		t.Errorf("guest last = %v, want signal-response", last)
@@ -420,9 +420,9 @@ func TestSignalDuplicateSuppressed(t *testing.T) {
 	r.JoinRoom(guest, protocol.JoinRoomMsg{Type: protocol.TypeJoinRoom, RoomID: roomID, GuestEpoch: "g"})
 
 	before := len(fc(guest).messages())
-	r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 5, Data: "a"})
-	r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 5, Data: "a"}) // duplicate
-	r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 3, Data: "b"}) // older
+	r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 5, Data: sigData("a")})
+	r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 5, Data: sigData("a")}) // duplicate
+	r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 3, Data: sigData("b")}) // older
 	after := len(fc(guest).messages())
 	if after-before != 1 {
 		t.Errorf("guest received %d messages, want 1 (duplicates suppressed)", after-before)
@@ -436,8 +436,8 @@ func TestSignalBufferedWhenPeerAway(t *testing.T) {
 	roomID := getRoomID(t, r)
 
 	// No guest yet; host signals should buffer.
-	r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 1, Data: "a"})
-	r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 2, Data: "b"})
+	r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 1, Data: sigData("a")})
+	r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 2, Data: sigData("b")})
 
 	// Guest joins with same epoch as... wait, the buffer is at the guest slot.
 	// The guest's epoch is set on join. Since the guest slot was never
@@ -719,9 +719,9 @@ func TestSignalBufferOverflow(t *testing.T) {
 	r.CreateRoom(host, protocol.CreateRoomMsg{Type: protocol.TypeCreateRoom, HostEpoch: "h"}, true)
 
 	// Fill the buffer (guest slot is empty).
-	r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 1, Data: "a"})
-	r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 2, Data: "b"})
-	res := r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 3, Data: "c"})
+	r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 1, Data: sigData("a")})
+	r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 2, Data: sigData("b")})
+	res := r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 3, Data: sigData("c")})
 	if !isErr(mapOf(res.Response), int(protocol.ErrSignalBufferOverflow)) {
 		t.Errorf("expected SIGNAL_BUFFER_OVERFLOW, got %v", res.Response)
 	}
@@ -757,7 +757,7 @@ func TestUnexpectedStateOnSecondHandshake(t *testing.T) {
 	if got := getRoomID(t, r); got != roomID {
 		t.Errorf("room id changed: %q -> %q", roomID, got)
 	}
-	if res := r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 1, Data: "a"}); res.CloseCode != nil {
+	if res := r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 1, Data: sigData("a")}); res.CloseCode != nil {
 		t.Errorf("signaling broken after rejected handshake: close %v", *res.CloseCode)
 	}
 }
@@ -855,6 +855,17 @@ func mapOf(v any) map[string]any {
 	return m
 }
 
+// sigData encodes s as the raw JSON string token a signal's `data` field
+// carries on the wire, which is what SignalMsg holds now that the payload is
+// relayed without being decoded.
+func sigData(s string) json.RawMessage {
+	b, err := json.Marshal(s)
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
 // fc returns the *fakeConn backing a Session.
 func fc(s *Session) *fakeConn { return s.Conn().(*fakeConn) }
 
@@ -914,5 +925,40 @@ func TestRoomsLiveGaugeTracksRoomCount(t *testing.T) {
 	r.CloseRoom(hs, protocol.CloseRoomMsg{Type: protocol.TypeCloseRoom})
 	if got := scrapeGauge(t, r.metrics, "signal_rooms_live"); got != 1 {
 		t.Errorf("signal_rooms_live = %v after close, want 1", got)
+	}
+}
+
+// `data` is relayed as the raw JSON token the sender used, so the type check
+// the decoder used to perform (when the field was a Go string) is now explicit.
+func TestSignalRejectsNonStringData(t *testing.T) {
+	r, _ := testRegistry(t)
+	host := NewSession(newFakeConn("1.1.1.1"))
+	guest := NewSession(newFakeConn("2.2.2.2"))
+	r.CreateRoom(host, protocol.CreateRoomMsg{Type: protocol.TypeCreateRoom, HostEpoch: "h"}, true)
+	roomID := getRoomID(t, r)
+	r.JoinRoom(guest, protocol.JoinRoomMsg{Type: protocol.TypeJoinRoom, RoomID: roomID, GuestEpoch: "g"})
+
+	for _, bad := range []string{`5`, `{"a":1}`, `null`, `[1]`} {
+		res := r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 1, Data: json.RawMessage(bad)})
+		if !isErr(mapOf(res.Response), int(protocol.ErrMalformedMessage)) {
+			t.Errorf("data %s: expected MALFORMED_MESSAGE, got %v", bad, res.Response)
+		}
+	}
+}
+
+// An escaped payload survives the relay unchanged: this is the whole point of
+// splicing the raw token through instead of decoding and re-encoding it.
+func TestSignalRelaysEscapedPayloadVerbatim(t *testing.T) {
+	r, _ := testRegistry(t)
+	host := NewSession(newFakeConn("1.1.1.1"))
+	guest := NewSession(newFakeConn("2.2.2.2"))
+	r.CreateRoom(host, protocol.CreateRoomMsg{Type: protocol.TypeCreateRoom, HostEpoch: "h"}, true)
+	roomID := getRoomID(t, r)
+	r.JoinRoom(guest, protocol.JoinRoomMsg{Type: protocol.TypeJoinRoom, RoomID: roomID, GuestEpoch: "g"})
+
+	payload := "{\"type\":\"offer\",\"sdp\":\"v=0\\r\\na=x <&> \\\"q\\\" ünï 🎉\"}"
+	r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 1, Data: sigData(payload)})
+	if got := fc(guest).last()["data"]; got != payload {
+		t.Errorf("data = %q, want %q", got, payload)
 	}
 }

@@ -422,6 +422,17 @@ duplicates on replay (`seq <= lastSeq` for the current epoch is silently
 ignored) and so ordering is preserved without trusting client clocks. The server
 never inspects `data`; it is opaque.
 
+It is opaque to the point of never being decoded: the relay copies the `data`
+token out of the inbound message and splices it into `signal-response`
+verbatim, because unquoting a `JSON.stringify`'d SDP blob only to re-quote it
+is most of what relaying one signal used to cost (see
+[LOAD\_TEST\_RESULTS.md](LOAD_TEST_RESULTS.md#throughput-and-cpu)). Two
+consequence: `bufferBytes` and `signal_bytes_relayed_total` count encoded
+bytes — quotes and escapes included — rather than the decoded length, so both
+run somewhat above the payload a client would measure. A non-string `data` is
+still `MALFORMED_MESSAGE`; that check is now explicit rather than a side effect
+of decoding.
+
 If the receiving slot is unoccupied, the message is buffered — see below.
 
 ### PeerConnected

@@ -10,6 +10,11 @@ proportional to signaling traffic. Removing that overhead — the hijacked
 per-connection goroutines — took a socket from 27.9 KB to **9.3 KB** and the
 ceiling of a 512 MB instance from ~15 000 sockets to **55 000**.
 
+The one CPU-side change measured here came later: relaying the signal payload
+without decoding and re-encoding it made the relay path ~39% faster in
+isolation, worth ~1.8 points of a core end to end. See [Relaying the payload
+without re-encoding it](#relaying-the-payload-without-re-encoding-it).
+
 ## Test setup
 
 Server in Docker (`alpine:3.20`), hard-limited to one CPU and 512 MB:
@@ -207,6 +212,87 @@ another 25%, so the transport is not where this server spends its time. It is
 a good trade for a server whose binding constraint is memory: 2.5% CPU for 3x
 the sockets.
 
+That 25% is what the next section goes after.
+
+## Relaying the payload without re-encoding it
+
+Run on 2026-08-13, against the build measured above.
+
+A signal's `data` field is opaque to this server — the design doc says so — but
+it was not treated that way. `data` was decoded into a Go `string` on the way
+in and re-encoded on the way out, and the payload is itself JSON
+(`JSON.stringify(sdp)`), so nearly every byte of it is an escaped quote:
+unquoting it and re-quoting it is work proportional to the largest field in the
+message, done twice, to arrive back at the bytes that came in.
+
+The relay now splices the raw `data` token straight from the inbound message
+into the outbound one (`protocol.AppendSignalResponse`), and writes the small
+fixed fields around it by hand rather than through `json.Marshal`'s reflection.
+Nothing else about the message changes — the encoder is tested byte-identical
+to marshaling the struct, HTML escaping and all.
+
+Isolated, the relay path is **~39% faster and allocates ~24% less**
+(`BenchmarkSignalRelay`, which decodes a signal off the wire, relays it, and
+encodes the `signal-response`; 6×3000 iterations per size, `benchstat`,
+p=0.002; dev laptop, not the container):
+
+| SDP size | Before | After | Δ | Allocs |
+|---|---|---|---|---|
+| 1 KB | 9.63 µs | 5.74 µs | **-40.4%** | 12 → 10 |
+| 2 KB | 15.76 µs | 10.04 µs | **-36.3%** | 12 → 10 |
+| 8 KB | 51.40 µs | 31.09 µs | **-39.5%** | 12 → 10 |
+
+Bytes allocated per relayed signal fall by 22–25% at every size: 9.46 KiB →
+7.11 KiB at the 2 KB payload the load test uses. The two allocations removed
+are the decoded payload string and `json.Marshal`'s output buffer.
+
+In the container the saving is real but much smaller, because the relay is not
+most of what the process does. `pair` mode at 600 rooms/s for 30 s, the two
+images alternating within each round so host noise hits both; normalized is CPU
+per 1000 signals relayed, which corrects for the generator not always
+delivering the same offered load (round 6's `before` run is 4% short):
+
+| Round | Before | After | Δ normalized |
+|---|---|---|---|
+| 1 | 78.1% | 75.2% | -3.5% |
+| 2 | 78.0% | 75.0% | -3.7% |
+| 3 | 73.9% | 72.6% | -1.1% |
+| 4 | 74.0% | 72.3% | -1.9% |
+| 5 | 73.8% | 72.5% | -2.1% |
+| 6 | 72.1% | 72.1% | -3.8% |
+| 7 | 74.3% | 73.7% | -0.8% |
+| **mean** | **74.9%** | **73.3%** | **-2.4%** |
+
+**~1.8 points of a core**, and the `after` run is cheaper in all 7 rounds.
+
+A CPU profile of a 20 s window at this rate agrees on where it went:
+`encoding/json.Marshal` drops from 8.8% of samples to 4.9%, and none of what
+remains is on the relay path — it is the handshake responses, which still
+marshal structs. The hand-written encoder that replaced it costs 1.3% of
+samples. `json.Unmarshal` is untouched at ~20% and is now the largest single
+JSON cost by a wide margin.
+
+The gain is proportional to payload bytes, which is worth knowing before
+expecting it everywhere. The same A/B at 300 rooms/s with 24 ICE candidates per
+side — 48 signals per room instead of 18, but all of them ~130-byte candidates
+rather than 2 KB offers — measured 68.0% before and 68.1% after, i.e. nothing.
+Escaping a small payload costs little, and what remains is the per-message
+overhead this change does not touch. The saving is on SDP, and it grows with
+SDP size, which is the direction real traffic moves: a multi-track offer is
+larger than the 2 KB the generator sends, not smaller.
+
+Two honest caveats. The container figure is a small difference between noisy
+runs: single runs of either build vary by ±3 points of a core, which is larger
+than the effect, so it shows up only as a paired comparison — the sign is
+consistent, the magnitude is ±1 point. And `signal_bytes_relayed_total` now
+counts encoded bytes rather than decoded ones, so it reads about 5% higher for
+the same traffic (116.3 MB → 122.8 MB across otherwise identical runs); that is
+a change in the metric's definition, not in the bytes on the wire.
+
+Memory is unaffected at rest — nothing about this is per-socket — but it does
+cut garbage on the signaling path by ~24% per relayed signal, which is the
+allocation rate that has to be collected within `GOMEMLIMIT` under load.
+
 ## Fallback path
 
 The poller needs a file descriptor, so a TLS connection terminated in-process
@@ -292,8 +378,15 @@ The next constraints, in the order they will bite:
 2. **Room ID allocation** — no longer binding after the nid's last digit went
    base32 (see [The room ID ceiling](#the-room-id-ceiling)); the pool is good
    past 100 000 live rooms, well above the memory wall.
-3. **CPU under signaling load** — `encoding/json` is ~25% of profile samples.
-   Relaying the raw signal payload without re-encoding it would be the largest
-   single saving.
+3. **CPU under signaling load** — still `encoding/json`, but only the decode
+   half of it now that the payload is relayed without re-encoding (see
+   [Relaying the payload without re-encoding
+   it](#relaying-the-payload-without-re-encoding-it)). `json.Unmarshal` is ~20%
+   of samples, and every message is parsed twice: once into `Envelope` to learn
+   its `type`, then again into the typed struct. Both passes run
+   `checkValid` over the whole payload, so a signal's SDP blob is scanned end
+   to end four times before it is relayed. Getting the `type` out without a
+   full parse — so the typed decode is the only pass — is the next saving, and
+   it is worth roughly what the re-encode was.
 4. **Per-message write syscalls** — 29% of samples, one `write` per message.
    Only coalescing across messages would reduce it, which trades latency.

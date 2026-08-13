@@ -72,11 +72,15 @@ func NewSession(c Conn) *Session {
 func (s *Session) Conn() Conn { return s.conn }
 
 // bufferedSignal is one signal held in a slot's buffer, destined for that slot.
+//
+// Data is the raw JSON string token from the sender, not the decoded payload.
+// Unmarshaling into a json.RawMessage copies the bytes out of the read buffer,
+// so holding onto it here does not pin the inbound message.
 type bufferedSignal struct {
 	Seq        int
 	FromRole   protocol.Role
 	FromEpoch  string
-	Data       string
+	Data       json.RawMessage
 	ReceivedAt time.Time
 }
 
@@ -238,6 +242,18 @@ func send(conn Conn, msg any) bool {
 		return false
 	}
 	return conn.Send(body)
+}
+
+// sendSignal encodes a signal-response directly into a fresh buffer and sends
+// it. It exists so the relay path skips json.Marshal entirely: the payload is
+// spliced in as it arrived, and the small fixed fields around it are cheaper
+// to write by hand than to reach through reflection for.
+func sendSignal(conn Conn, fromRole protocol.Role, fromEpoch string, seq int, data json.RawMessage, receivedAt time.Time) bool {
+	if conn == nil {
+		return false
+	}
+	buf := make([]byte, 0, len(data)+128)
+	return conn.Send(protocol.AppendSignalResponse(buf, fromRole, fromEpoch, seq, data, isoTime(receivedAt)))
 }
 
 // isoTime formats t as an ISO 8601 UTC string.

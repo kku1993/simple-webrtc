@@ -59,7 +59,7 @@ func New() *Metrics {
 			Name: "signal_signals_relayed_total", Help: "Signal messages relayed.",
 		}),
 		BytesRelayed: prometheus.NewCounter(prometheus.CounterOpts{
-			Name: "signal_bytes_relayed_total", Help: "Bytes of signal data relayed.",
+			Name: "signal_bytes_relayed_total", Help: "Bytes of signal data relayed, as encoded on the wire (quotes and escapes included).",
 		}),
 		RejoinsRecreated: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "signal_rejoins_recreated_total", Help: "Rejoins that recreated a lost room.",
