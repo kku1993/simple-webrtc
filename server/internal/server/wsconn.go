@@ -29,13 +29,19 @@ var frameBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 // does not pin an oversized buffer for the process lifetime.
 const maxPooledFrameBuf = 64 << 10
 
-// readChunk is how much is pulled off a readable socket per syscall. It is a
-// pooled scratch buffer shared by all connections, not per-connection state:
-// a signaling message is well under this, so one read usually drains the
-// socket.
+// readChunk is how much a poller-driven read pulls off a socket per syscall.
+// The buffer comes from a pool and is held only while a connection is being
+// served, never while it is idle, so it can be generous: a signaling message
+// fits well inside one, which means one read usually drains the socket.
 const readChunk = 16 << 10
 
 var readBufPool = sync.Pool{New: func() any { b := make([]byte, readChunk); return &b }}
+
+// fallbackReadChunk is the same buffer for a connection served by a blocking
+// read loop. That buffer is pinned for the connection's life -- the goroutine
+// sits in Read holding it -- so it is sized to a typical message instead, and
+// anything larger costs an extra read.
+const fallbackReadChunk = 4 << 10
 
 // maxPendingBytes caps what a connection will hold for a client that has
 // stopped reading. It sits above MaxBufferedSignalBytes (256 KB), the largest
@@ -427,17 +433,17 @@ func (c *wsConn) isClosed() bool {
 
 // --- read path ---
 
-// onReadable drains the socket and dispatches every complete message in it. It
-// returns false if the connection was closed and must not be re-armed.
+// onReadable drains the socket and dispatches every complete message in it,
+// using scratch as its read buffer. It returns false if the connection was
+// closed and must not be re-armed.
 //
 // Called from the poller's event goroutine (Linux) or the fallback read loop.
-func (c *wsConn) onReadable() bool {
+// The buffer belongs to the caller because the two differ in how long it is
+// held: an event goroutine borrows one from a pool for the length of a
+// message, while a blocking read loop keeps its buffer parked in Read.
+func (c *wsConn) onReadable(scratch []byte) bool {
 	c.rmu.Lock()
 	defer c.rmu.Unlock()
-
-	bufp := readBufPool.Get().(*[]byte)
-	defer readBufPool.Put(bufp)
-	scratch := *bufp
 
 	for {
 		n, err := c.readOnce(scratch)

@@ -7,7 +7,8 @@ package server
 // Close unblocks the read by closing the socket, so this returns without any
 // separate signal.
 func readLoop(c *wsConn) {
-	for c.onReadable() {
+	buf := make([]byte, fallbackReadChunk)
+	for c.onReadable(buf) {
 		if c.isClosed() {
 			return
 		}

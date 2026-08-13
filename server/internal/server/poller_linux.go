@@ -169,7 +169,10 @@ func (p *poller) run() {
 // goroutine, which exits as soon as the socket has nothing left to parse -- so
 // its stack is charged to the message, not to the connection.
 func serve(c *wsConn) {
-	if !c.onReadable() {
+	bufp := readBufPool.Get().(*[]byte)
+	ok := c.onReadable(*bufp)
+	readBufPool.Put(bufp)
+	if !ok {
 		return // closed; unwatch has already run
 	}
 	if c.isClosed() {
