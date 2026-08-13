@@ -688,13 +688,14 @@ func (r *Registry) acquireGlobalRoomSlot() bool {
 			return false
 		}
 		if r.roomsGlobal.CompareAndSwap(cur, cur+1) {
+			r.metrics.SetLiveRooms(cur + 1)
 			return true
 		}
 	}
 }
 
 func (r *Registry) releaseGlobalRoomSlot() {
-	r.roomsGlobal.Add(-1)
+	r.metrics.SetLiveRooms(r.roomsGlobal.Add(-1))
 }
 
 // computeExpiresAt = min(instantiatedAt + roomMaxLifetime, createdAt + tokenTtl).

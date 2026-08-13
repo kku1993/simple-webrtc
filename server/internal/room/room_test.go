@@ -2,6 +2,8 @@ package room
 
 import (
 	"encoding/json"
+	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -858,3 +860,59 @@ func fc(s *Session) *fakeConn { return s.Conn().(*fakeConn) }
 
 // last is a helper on Result.
 func (r Result) last() map[string]any { return mapOf(r.Response) }
+
+// scrapeGauge reads a single gauge out of the real Prometheus exposition
+// output. It goes through the /metrics handler rather than the in-process
+// value so that a gauge which is registered but never set -- the failure this
+// test guards against -- is caught.
+func scrapeGauge(t *testing.T, m *metrics.Metrics, name string) float64 {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	m.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/metrics", nil))
+	for _, line := range strings.Split(rec.Body.String(), "\n") {
+		if strings.HasPrefix(line, name+" ") {
+			v, err := strconv.ParseFloat(strings.TrimSpace(strings.TrimPrefix(line, name+" ")), 64)
+			if err != nil {
+				t.Fatalf("parse %s: %v", name, err)
+			}
+			return v
+		}
+	}
+	t.Fatalf("%s not found in /metrics output", name)
+	return 0
+}
+
+func TestRoomsLiveGaugeTracksRoomCount(t *testing.T) {
+	r, _ := testRegistry(t)
+
+	if got := scrapeGauge(t, r.metrics, "signal_rooms_live"); got != 0 {
+		t.Fatalf("signal_rooms_live = %v before any room, want 0", got)
+	}
+
+	hs := NewSession(newFakeConn("1.1.1.1"))
+	if res := r.CreateRoom(hs, protocol.CreateRoomMsg{
+		Type:      protocol.TypeCreateRoom,
+		HostEpoch: "host-epoch-1",
+	}, true); res.Response == nil {
+		t.Fatalf("expected create-room-response")
+	}
+	if got := scrapeGauge(t, r.metrics, "signal_rooms_live"); got != 1 {
+		t.Errorf("signal_rooms_live = %v after create, want 1", got)
+	}
+
+	hs2 := NewSession(newFakeConn("3.3.3.3"))
+	if res := r.CreateRoom(hs2, protocol.CreateRoomMsg{
+		Type:      protocol.TypeCreateRoom,
+		HostEpoch: "host-epoch-2",
+	}, true); res.Response == nil {
+		t.Fatalf("expected create-room-response")
+	}
+	if got := scrapeGauge(t, r.metrics, "signal_rooms_live"); got != 2 {
+		t.Errorf("signal_rooms_live = %v after second create, want 2", got)
+	}
+
+	r.CloseRoom(hs, protocol.CloseRoomMsg{Type: protocol.TypeCloseRoom})
+	if got := scrapeGauge(t, r.metrics, "signal_rooms_live"); got != 1 {
+		t.Errorf("signal_rooms_live = %v after close, want 1", got)
+	}
+}

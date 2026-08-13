@@ -9,7 +9,6 @@ package metrics
 
 import (
 	"net/http"
-	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -100,9 +99,11 @@ func (m *Metrics) Handler() http.Handler {
 	})
 }
 
-// SetLiveRooms sets the gauge from an atomic counter.
+// SetLiveRooms sets the live-room gauge. Callers pass an already-loaded count;
+// taking the address of the parameter and re-reading it atomically would only
+// read this function's own copy, which guarantees nothing.
 func (m *Metrics) SetLiveRooms(n int64) {
-	m.RoomsLive.Set(float64(atomic.LoadInt64(&n)))
+	m.RoomsLive.Set(float64(n))
 }
 
 // Uptime returns the server uptime.
