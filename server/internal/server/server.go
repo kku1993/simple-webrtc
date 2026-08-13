@@ -163,7 +163,13 @@ func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
 	s.metrics.ConnectionsLive.Inc()
 
 	sess := room.NewSession(c)
-	c.runReadLoop(s, sess)
+	// Hand the read loop to a fresh goroutine and return, so net/http can drop
+	// the hijacked connection. Blocking here keeps that http.conn reachable for
+	// the whole life of the socket, and with it the 4 KB bufio.Reader and 4 KB
+	// bufio.Writer it owns -- a cost paid by every connection, on a server whose
+	// binding constraint is how many idle sockets fit in memory. The goroutine
+	// count is unchanged: this one exits where it used to block.
+	go c.runReadLoop(s, sess)
 }
 
 // resolveIP determines the client IP per docs/DESIGN.md §"Client IP resolution".
