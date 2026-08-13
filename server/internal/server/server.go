@@ -7,11 +7,14 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
 	"reflect"
 	"strconv"
@@ -24,32 +27,26 @@ import (
 	"github.com/kku1993/simple-webrtc-server/internal/requestlog"
 	"github.com/kku1993/simple-webrtc-server/internal/room"
 	"github.com/kku1993/simple-webrtc-server/internal/turnstile"
-	"github.com/gorilla/websocket"
+	"github.com/gobwas/ws"
 )
 
-// upgrader is configured per-connection because the read limit depends on cfg.
-// CheckOrigin is disabled here because origin authorization is enforced
-// explicitly in handleSignal via cfg.OriginAllowed before the upgrade; relying
-// on gorilla's default would reject legitimate cross-origin requests even when
-// ALLOWED_ORIGINS permits them (including "*").
-// writeBufferPool shares write buffers across connections. A signaling server
-// holds far more idle sockets than concurrently-writing ones -- after both
-// peers report connected a room's sockets sit idle for peerConnectedGraceSec
-// -- so a per-connection write buffer is paid for by every socket but used by
-// almost none at any instant.
-var writeBufferPool = &sync.Pool{}
+// Origin authorization is enforced explicitly in handleSignal via
+// cfg.OriginAllowed before the upgrade, so no origin check is configured on the
+// upgrader itself: a library default would reject legitimate cross-origin
+// requests even when ALLOWED_ORIGINS permits them (including "*"). The frame
+// size limit likewise depends on cfg and is applied per connection.
+//
+// frameBufPool holds scratch buffers used to serialize a WebSocket frame
+// (header + payload) so each message costs one Write syscall instead of two.
+// Unlike a per-connection buffer, a pooled one is held only for the duration of
+// a write, which matters here because most sockets are idle: after both peers
+// report connected a room's sockets sit open for peerConnectedGraceSec without
+// sending anything.
+var frameBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 
-// Buffers are sized for the traffic this server actually carries: SDP
-// offers/answers of a few KB and ICE candidates of a few hundred bytes. A
-// smaller read buffer costs an extra read syscall on the larger SDP frames and
-// saves that memory on every concurrent socket, which is the binding
-// constraint at scale.
-var defaultUpgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 4096,
-	WriteBufferPool: writeBufferPool,
-	CheckOrigin:     func(*http.Request) bool { return true },
-}
+// maxPooledFrameBuf caps what goes back into the pool so one large SDP frame
+// does not pin an oversized buffer for the process lifetime.
+const maxPooledFrameBuf = 64 << 10
 
 // Server is the HTTP/WebSocket server.
 type Server struct {
@@ -145,21 +142,31 @@ func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
 	// IncConnections succeeded; we decrement on close (read loop exit or
 	// upgrade failure below).
 
-	upgrader := defaultUpgrader
-	conn, err := upgrader.Upgrade(w, r, nil)
+	conn, brw, _, err := ws.HTTPUpgrader{}.Upgrade(r, w)
 	if err != nil {
 		s.registry.DecConnections()
 		if rec, ok := w.(*requestlog.StatusRecorder); ok {
 			rec.SetReason("websocket upgrade failed: " + err.Error())
 		}
+		if conn != nil {
+			_ = conn.Close()
+		}
 		return
 	}
-	conn.SetReadLimit(int64(s.cfg.MaxFrameBytes))
+	// net/http hands the hijacked connection's bufio pair to us, but this
+	// transport reads frames straight off the net.Conn and never uses it. Copy
+	// out anything the client pipelined behind the handshake -- normally
+	// nothing -- and let the pair go unreferenced when the handler returns.
+	var pre []byte
+	if n := brw.Reader.Buffered(); n > 0 {
+		peek, _ := brw.Reader.Peek(n)
+		pre = append([]byte(nil), peek...)
+	}
 
 	// Apply the read deadline for the handshake (first message).
 	_ = conn.SetReadDeadline(time.Now().Add(s.cfg.HandshakeTimeout()))
 
-	c := newWSConn(conn, ip, s.cfg.PingInterval())
+	c := newWSConn(conn, pre, ip, s.cfg.PingInterval(), int64(s.cfg.MaxFrameBytes))
 	s.metrics.ConnectionsLive.Inc()
 
 	sess := room.NewSession(c)
@@ -347,34 +354,85 @@ func responseInfo(resp any) (responseType, roomID string, errorCode *int, reason
 
 // --- WebSocket Conn implementation ---
 
-// wsConn implements room.Conn over a gorilla/websocket connection.
+// closeError reports that the peer sent a close frame.
+type closeError struct {
+	code int
+	text string
+}
+
+func (e *closeError) Error() string {
+	return fmt.Sprintf("websocket: close %d (%s)", e.code, e.text)
+}
+
+var (
+	errFrameTooLarge = errors.New("websocket: frame exceeds max frame bytes")
+	errProtocol      = errors.New("websocket: protocol error")
+)
+
+// wsConn implements room.Conn over a gobwas/ws connection.
+//
+// Frames are read straight off the net.Conn rather than through a
+// per-connection buffered reader: this server holds far more idle sockets than
+// actively-reading ones, so a buffer parked on every connection is paid for
+// continuously and used rarely. The cost is an extra read syscall per frame
+// header, which is only paid when a frame actually arrives.
 //
 // Writes are funnelled through a dedicated writer goroutine reading from a
 // buffered channel, so Send is non-blocking and never deadlocks with the room
 // mutex. Reads are driven by runReadLoop. Pings are sent on a ticker.
 type wsConn struct {
-	conn      *websocket.Conn
+	conn      net.Conn
+	rd        io.Reader // conn, or a wrapper replaying bytes pipelined behind the handshake
+	maxFrame  int64
 	ip        string
 	pingEvery time.Duration
 
-	sendCh   chan []byte
-	closeCh  chan struct{}
+	sendCh    chan []byte
+	closeCh   chan struct{}
 	closeOnce sync.Once
 
-	closeMu       sync.Mutex
-	closeCode     *int    // last close code passed to Close, for request logging
-	closeReason   string  // last close reason passed to Close, for request logging
-	writeErr error // set when the writer goroutine exits
+	// writeMu serializes frame writes. gorilla/websocket made WriteControl
+	// safe to call concurrently with WriteMessage; gobwas/ws is a framing
+	// library with no such guarantee, so control frames sent from Close and
+	// from the read loop must not interleave with the writer goroutine.
+	writeMu sync.Mutex
+
+	closeMu     sync.Mutex
+	closeCode   *int   // last close code passed to Close, for request logging
+	closeReason string // last close reason passed to Close, for request logging
 }
 
-func newWSConn(c *websocket.Conn, ip string, pingEvery time.Duration) *wsConn {
-	return &wsConn{
+// preReader replays bytes the client pipelined behind the HTTP handshake
+// before falling through to the socket. It is allocated only when there are
+// such bytes, which for a well-behaved client is never.
+type preReader struct {
+	pre  []byte
+	conn net.Conn
+}
+
+func (r *preReader) Read(p []byte) (int, error) {
+	if len(r.pre) > 0 {
+		n := copy(p, r.pre)
+		r.pre = r.pre[n:]
+		return n, nil
+	}
+	return r.conn.Read(p)
+}
+
+func newWSConn(c net.Conn, pre []byte, ip string, pingEvery time.Duration, maxFrame int64) *wsConn {
+	w := &wsConn{
 		conn:      c,
+		rd:        c,
+		maxFrame:  maxFrame,
 		ip:        ip,
 		pingEvery: pingEvery,
 		sendCh:    make(chan []byte, 64),
 		closeCh:   make(chan struct{}),
 	}
+	if len(pre) > 0 {
+		w.rd = &preReader{pre: pre, conn: c}
+	}
+	return w
 }
 
 // Send pushes a message to the writer goroutine. It returns false if the
@@ -397,6 +455,30 @@ func (c *wsConn) Send(data []byte) bool {
 	}
 }
 
+// writeFrame serializes one frame through a pooled buffer and writes it in a
+// single syscall. A non-zero deadline bounds control-frame writes; it is
+// cleared afterwards so it cannot leak onto subsequent data writes.
+func (c *wsConn) writeFrame(f ws.Frame, deadline time.Duration) error {
+	buf := frameBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	err := ws.WriteFrame(buf, f)
+	if err == nil {
+		c.writeMu.Lock()
+		if deadline > 0 {
+			_ = c.conn.SetWriteDeadline(time.Now().Add(deadline))
+		}
+		_, err = c.conn.Write(buf.Bytes())
+		if deadline > 0 {
+			_ = c.conn.SetWriteDeadline(time.Time{})
+		}
+		c.writeMu.Unlock()
+	}
+	if buf.Cap() <= maxPooledFrameBuf {
+		frameBufPool.Put(buf)
+	}
+	return err
+}
+
 // Close shuts down the connection once.
 func (c *wsConn) Close(code int, reason string) {
 	c.closeOnce.Do(func() {
@@ -407,8 +489,7 @@ func (c *wsConn) Close(code int, reason string) {
 		c.closeMu.Unlock()
 		close(c.closeCh)
 		// Best-effort close frame; ignore errors.
-		msg := websocket.FormatCloseMessage(code, reason)
-		_ = c.conn.WriteControl(websocket.CloseMessage, msg, time.Now().Add(time.Second))
+		_ = c.writeFrame(ws.NewCloseFrame(ws.NewCloseFrameBody(ws.StatusCode(code), reason)), time.Second)
 		_ = c.conn.Close()
 	})
 }
@@ -429,17 +510,74 @@ func (c *wsConn) CloseReason() string {
 
 func (c *wsConn) IP() string { return c.ip }
 
+// readMessage returns the next complete data message, answering pings,
+// refreshing the keepalive deadline on pongs, and reassembling fragments
+// inline. Control frames never reach the caller.
+func (c *wsConn) readMessage() (ws.OpCode, []byte, error) {
+	var (
+		frag    []byte
+		fragOp  ws.OpCode
+		fragged bool
+	)
+	for {
+		h, err := ws.ReadHeader(c.rd)
+		if err != nil {
+			return 0, nil, err
+		}
+		if h.Length < 0 || h.Length > c.maxFrame || int64(len(frag))+h.Length > c.maxFrame {
+			return 0, nil, errFrameTooLarge
+		}
+		var payload []byte
+		if h.Length > 0 {
+			payload = make([]byte, h.Length)
+			if _, err := io.ReadFull(c.rd, payload); err != nil {
+				return 0, nil, err
+			}
+			if h.Masked {
+				ws.Cipher(payload, h.Mask, 0)
+			}
+		}
+		switch h.OpCode {
+		case ws.OpPing:
+			if err := c.writeFrame(ws.NewPongFrame(payload), time.Second); err != nil {
+				return 0, nil, err
+			}
+		case ws.OpPong:
+			_ = c.conn.SetReadDeadline(time.Now().Add(c.pingEvery * 3))
+		case ws.OpClose:
+			code, text := ws.StatusNoStatusRcvd, ""
+			if len(payload) >= 2 {
+				code = ws.StatusCode(uint16(payload[0])<<8 | uint16(payload[1]))
+				text = string(payload[2:])
+			}
+			return 0, nil, &closeError{code: int(code), text: text}
+		case ws.OpContinuation:
+			if !fragged {
+				return 0, nil, errProtocol
+			}
+			frag = append(frag, payload...)
+			if h.Fin {
+				return fragOp, frag, nil
+			}
+		case ws.OpText, ws.OpBinary:
+			if fragged {
+				return 0, nil, errProtocol
+			}
+			if h.Fin {
+				return h.OpCode, payload, nil
+			}
+			fragged, fragOp, frag = true, h.OpCode, append(frag, payload...)
+		default:
+			return 0, nil, errProtocol
+		}
+	}
+}
+
 // runReadLoop drives the read side: the handshake deadline, the ping/pong
-// handler, and dispatching inbound messages to the registry.
+// handling, and dispatching inbound messages to the registry.
 func (c *wsConn) runReadLoop(s *Server, sess *room.Session) {
 	// Writer goroutine.
 	go c.writeLoop()
-
-	// Ping/pong: close if two consecutive pongs are missed.
-	c.conn.SetPongHandler(func(string) error {
-		_ = c.conn.SetReadDeadline(time.Now().Add(c.pingEvery * 3))
-		return nil
-	})
 
 	defer func() {
 		s.registry.Detach(sess)
@@ -458,7 +596,7 @@ func (c *wsConn) runReadLoop(s *Server, sess *room.Session) {
 	handshakeDone := false
 
 	for {
-		op, raw, err := c.conn.ReadMessage()
+		op, raw, err := c.readMessage()
 		if err != nil {
 			// Handshake timeout surfaces as a read deadline error.
 			if !handshakeDone && isTimeout(err) {
@@ -473,7 +611,7 @@ func (c *wsConn) runReadLoop(s *Server, sess *room.Session) {
 			}
 			return
 		}
-		if op == websocket.BinaryMessage {
+		if op == ws.OpBinary {
 			// Binary frames are a protocol error.
 			_ = c.sendError(protocol.ErrMalformedMessage, "binary frames not allowed", "")
 			c.Close(int(protocol.CloseProtocolError), "binary frame rejected")
@@ -516,12 +654,12 @@ func (c *wsConn) writeLoop() {
 		case <-c.closeCh:
 			return
 		case msg := <-c.sendCh:
-			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+			if err := c.writeFrame(ws.NewTextFrame(msg), 0); err != nil {
 				c.Close(int(protocol.CloseProtocolError), "write error")
 				return
 			}
 		case <-pingTicker.C:
-			if err := c.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(time.Second)); err != nil {
+			if err := c.writeFrame(ws.NewPingFrame(nil), time.Second); err != nil {
 				return
 			}
 		}
@@ -545,12 +683,15 @@ func isTimeout(err error) bool {
 	return false
 }
 
-// isCloseError reports whether err is a gorilla/websocket close error (i.e.
-// the peer sent a close frame or the connection was cleanly closed).
+// isCloseError reports whether err is a WebSocket close error (i.e. the peer
+// sent a close frame or the connection was cleanly closed).
 func isCloseError(err error) bool {
 	if err == nil {
 		return false
 	}
-	var ce *websocket.CloseError
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var ce *closeError
 	return errors.As(err, &ce)
 }
