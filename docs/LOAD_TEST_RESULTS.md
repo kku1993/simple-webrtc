@@ -128,10 +128,12 @@ signaling protocol changed.
 for a GC cycle that arrives at a bad moment. 45 000 is the last size with room
 to spare.
 
-At 45 000 the run also produced two `1302 could not allocate room id` errors.
-That is the room ID allocator running out of retries against 45 000 live rooms,
-not a memory or transport limit, and it is the first non-memory ceiling this
-server will hit as capacity grows.
+At 45 000 and above, runs intermittently produce one or two
+`1302 could not allocate room id` errors out of 45 000 creates -- two of the
+three runs at that size did, one did not. That is the room ID allocator running
+out of retries against a room table that large, not a memory or transport
+limit, and it is the first non-memory ceiling this server will hit as capacity
+grows.
 
 ## Throughput and CPU
 
