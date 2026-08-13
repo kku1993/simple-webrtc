@@ -11,13 +11,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/kku1993/simple-webrtc-server/internal/config"
 	"github.com/kku1993/simple-webrtc-server/internal/metrics"
+	"github.com/kku1993/simple-webrtc-server/internal/protocol"
 	"github.com/kku1993/simple-webrtc-server/internal/requestlog"
 	"github.com/kku1993/simple-webrtc-server/internal/room"
-	"github.com/kku1993/simple-webrtc-server/internal/tombstone"
 	"github.com/kku1993/simple-webrtc-server/internal/token"
-	"github.com/gorilla/websocket"
+	"github.com/kku1993/simple-webrtc-server/internal/tombstone"
 )
 
 // lockedBuffer is a concurrency-safe bytes.Buffer suitable for capturing log
@@ -193,11 +194,25 @@ func TestServerHandshakeTimeout(t *testing.T) {
 
 	c := dial(t, hs)
 	defer c.Close()
-	// Don't send anything; expect to be closed.
+	// Don't send anything; expect the handshake-timeout error followed by a
+	// close. The error frame is written synchronously before the close, so it
+	// is delivered rather than raced away.
 	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
-	_, _, err := c.ReadMessage()
-	if err == nil {
-		t.Errorf("expected close/error on handshake timeout")
+	sawError := false
+	for {
+		_, data, err := c.ReadMessage()
+		if err != nil {
+			break
+		}
+		var m map[string]any
+		if json.Unmarshal(data, &m) == nil && m["type"] == protocol.TypeErrorResponse {
+			if code, ok := m["errorCode"].(float64); ok && int(code) == int(protocol.ErrHandshakeTimeout) {
+				sawError = true
+			}
+		}
+	}
+	if !sawError {
+		t.Errorf("expected a handshake-timeout error before close")
 	}
 }
 
@@ -484,5 +499,84 @@ func TestServerRequestLogHTTPRejection(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("expected an http 403 log entry with reason 'origin not allowed: https://evil.example.com'; buf=%s", logBuf.String())
+	}
+}
+
+// The frame parser is hand-rolled (wsconn.go), so the cases that exercise its
+// buffering are worth pinning: a payload larger than one read, and a message
+// split across continuation frames.
+
+func TestServerLargeSignalSpansReads(t *testing.T) {
+	hs, _ := newTestServer(t, testConfig())
+
+	host := dial(t, hs)
+	defer host.Close()
+	guest := dial(t, hs)
+	defer guest.Close()
+
+	sendMsg(t, host, map[string]any{"type": "create-room", "hostEpoch": "h1"})
+	roomID := recvMsg(t, host)["roomId"].(string)
+	sendMsg(t, guest, map[string]any{"type": "join-room", "roomId": roomID, "guestEpoch": "g1"})
+	_ = recvMsg(t, guest)
+	_ = recvMsg(t, host)
+
+	// Comfortably larger than readChunk, so the payload arrives over several
+	// reads and the connection has to buffer the partial frame.
+	data := strings.Repeat("x", 3*readChunk)
+	sendMsg(t, host, map[string]any{"type": "signal", "seq": 1, "data": data})
+
+	sr := recvMsg(t, guest)
+	if sr["type"] != "signal-response" {
+		t.Fatalf("guest got %v, want signal-response", sr["type"])
+	}
+	if sr["data"] != data {
+		t.Errorf("payload corrupted: got %d bytes, want %d", len(sr["data"].(string)), len(data))
+	}
+}
+
+func TestServerFragmentedMessage(t *testing.T) {
+	hs, _ := newTestServer(t, testConfig())
+
+	// A small write buffer makes gorilla flush partial frames, so the message
+	// arrives as a text frame plus continuations -- 16 of them, at these
+	// sizes.
+	d := &websocket.Dialer{WriteBufferSize: 256, ReadBufferSize: 4096}
+	u := "ws" + strings.TrimPrefix(hs.URL, "http") + "/v1/signal"
+	host, _, err := d.DialContext(context.Background(), u, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer host.Close()
+	guest := dial(t, hs)
+	defer guest.Close()
+
+	sendMsg(t, host, map[string]any{"type": "create-room", "hostEpoch": "h1"})
+	roomID := recvMsg(t, host)["roomId"].(string)
+	sendMsg(t, guest, map[string]any{"type": "join-room", "roomId": roomID, "guestEpoch": "g1"})
+	_ = recvMsg(t, guest)
+	_ = recvMsg(t, host)
+
+	data := strings.Repeat("y", 4096)
+	body, _ := json.Marshal(map[string]any{"type": "signal", "seq": 1, "data": data})
+	w, err := host.NextWriter(websocket.TextMessage)
+	if err != nil {
+		t.Fatalf("NextWriter: %v", err)
+	}
+	for off := 0; off < len(body); off += 100 {
+		end := min(off+100, len(body))
+		if _, err := w.Write(body[off:end]); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("close writer: %v", err)
+	}
+
+	sr := recvMsg(t, guest)
+	if sr["type"] != "signal-response" {
+		t.Fatalf("guest got %v, want signal-response", sr["type"])
+	}
+	if sr["data"] != data {
+		t.Errorf("reassembled payload does not match")
 	}
 }

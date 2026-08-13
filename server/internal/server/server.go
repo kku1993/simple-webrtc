@@ -1,33 +1,28 @@
 // Package server implements the WebSocket signaling endpoint, HTTP operational
 // endpoints (/healthz, /metrics), origin checking, the handshake timeout, and
-// the per-connection read/write loops.
+// the WebSocket transport (wsconn.go, poller_linux.go).
 //
 // It bridges the raw WebSocket transport to the room.Registry by implementing
 // room.Conn for each connection.
 package server
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"log"
-	"net"
 	"net/http"
 	"reflect"
 	"strconv"
-	"sync"
 	"time"
 
+	"github.com/gobwas/ws"
 	"github.com/kku1993/simple-webrtc-server/internal/config"
 	"github.com/kku1993/simple-webrtc-server/internal/metrics"
 	"github.com/kku1993/simple-webrtc-server/internal/protocol"
 	"github.com/kku1993/simple-webrtc-server/internal/requestlog"
 	"github.com/kku1993/simple-webrtc-server/internal/room"
 	"github.com/kku1993/simple-webrtc-server/internal/turnstile"
-	"github.com/gobwas/ws"
 )
 
 // Origin authorization is enforced explicitly in handleSignal via
@@ -35,19 +30,6 @@ import (
 // upgrader itself: a library default would reject legitimate cross-origin
 // requests even when ALLOWED_ORIGINS permits them (including "*"). The frame
 // size limit likewise depends on cfg and is applied per connection.
-//
-// frameBufPool holds scratch buffers used to serialize a WebSocket frame
-// (header + payload) so each message costs one Write syscall instead of two.
-// Unlike a per-connection buffer, a pooled one is held only for the duration of
-// a write, which matters here because most sockets are idle: after both peers
-// report connected a room's sockets sit open for peerConnectedGraceSec without
-// sending anything.
-var frameBufPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
-
-// maxPooledFrameBuf caps what goes back into the pool so one large SDP frame
-// does not pin an oversized buffer for the process lifetime.
-const maxPooledFrameBuf = 64 << 10
-
 // Server is the HTTP/WebSocket server.
 type Server struct {
 	cfg       config.Config
@@ -94,8 +76,8 @@ func (s *Server) Shutdown(ctx context.Context) error {
 func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
-		"status":     "ok",
-		"uptimeSec":  int(s.metrics.Uptime().Seconds()),
+		"status":    "ok",
+		"uptimeSec": int(s.metrics.Uptime().Seconds()),
 	})
 }
 
@@ -163,20 +145,16 @@ func (s *Server) handleSignal(w http.ResponseWriter, r *http.Request) {
 		pre = append([]byte(nil), peek...)
 	}
 
-	// Apply the read deadline for the handshake (first message).
-	_ = conn.SetReadDeadline(time.Now().Add(s.cfg.HandshakeTimeout()))
-
-	c := newWSConn(conn, pre, ip, s.cfg.PingInterval(), int64(s.cfg.MaxFrameBytes))
+	c := newWSConn(s, conn, pre, ip)
 	s.metrics.ConnectionsLive.Inc()
 
-	sess := room.NewSession(c)
-	// Hand the read loop to a fresh goroutine and return, so net/http can drop
-	// the hijacked connection. Blocking here keeps that http.conn reachable for
+	// Hand the connection to the transport and return, so net/http can drop the
+	// hijacked connection. Blocking here would keep that http.conn reachable for
 	// the whole life of the socket, and with it the 4 KB bufio.Reader and 4 KB
 	// bufio.Writer it owns -- a cost paid by every connection, on a server whose
-	// binding constraint is how many idle sockets fit in memory. The goroutine
-	// count is unchanged: this one exits where it used to block.
-	go c.runReadLoop(s, sess)
+	// binding constraint is how many idle sockets fit in memory.
+	watch(c)
+	c.start()
 }
 
 // resolveIP determines the client IP per docs/DESIGN.md §"Client IP resolution".
@@ -350,348 +328,4 @@ func responseInfo(resp any) (responseType, roomID string, errorCode *int, reason
 		reason = f.String()
 	}
 	return responseType, roomID, errorCode, reason
-}
-
-// --- WebSocket Conn implementation ---
-
-// closeError reports that the peer sent a close frame.
-type closeError struct {
-	code int
-	text string
-}
-
-func (e *closeError) Error() string {
-	return fmt.Sprintf("websocket: close %d (%s)", e.code, e.text)
-}
-
-var (
-	errFrameTooLarge = errors.New("websocket: frame exceeds max frame bytes")
-	errProtocol      = errors.New("websocket: protocol error")
-)
-
-// wsConn implements room.Conn over a gobwas/ws connection.
-//
-// Frames are read straight off the net.Conn rather than through a
-// per-connection buffered reader: this server holds far more idle sockets than
-// actively-reading ones, so a buffer parked on every connection is paid for
-// continuously and used rarely. The cost is an extra read syscall per frame
-// header, which is only paid when a frame actually arrives.
-//
-// Writes are funnelled through a dedicated writer goroutine reading from a
-// buffered channel, so Send is non-blocking and never deadlocks with the room
-// mutex. Reads are driven by runReadLoop. Pings are sent on a ticker.
-type wsConn struct {
-	conn      net.Conn
-	rd        io.Reader // conn, or a wrapper replaying bytes pipelined behind the handshake
-	maxFrame  int64
-	ip        string
-	pingEvery time.Duration
-
-	sendCh    chan []byte
-	closeCh   chan struct{}
-	closeOnce sync.Once
-
-	// writeMu serializes frame writes. gorilla/websocket made WriteControl
-	// safe to call concurrently with WriteMessage; gobwas/ws is a framing
-	// library with no such guarantee, so control frames sent from Close and
-	// from the read loop must not interleave with the writer goroutine.
-	writeMu sync.Mutex
-
-	closeMu     sync.Mutex
-	closeCode   *int   // last close code passed to Close, for request logging
-	closeReason string // last close reason passed to Close, for request logging
-}
-
-// preReader replays bytes the client pipelined behind the HTTP handshake
-// before falling through to the socket. It is allocated only when there are
-// such bytes, which for a well-behaved client is never.
-type preReader struct {
-	pre  []byte
-	conn net.Conn
-}
-
-func (r *preReader) Read(p []byte) (int, error) {
-	if len(r.pre) > 0 {
-		n := copy(p, r.pre)
-		r.pre = r.pre[n:]
-		return n, nil
-	}
-	return r.conn.Read(p)
-}
-
-func newWSConn(c net.Conn, pre []byte, ip string, pingEvery time.Duration, maxFrame int64) *wsConn {
-	w := &wsConn{
-		conn:      c,
-		rd:        c,
-		maxFrame:  maxFrame,
-		ip:        ip,
-		pingEvery: pingEvery,
-		sendCh:    make(chan []byte, 64),
-		closeCh:   make(chan struct{}),
-	}
-	if len(pre) > 0 {
-		w.rd = &preReader{pre: pre, conn: c}
-	}
-	return w
-}
-
-// Send pushes a message to the writer goroutine. It returns false if the
-// connection is closing or the send buffer is full (slow client).
-func (c *wsConn) Send(data []byte) bool {
-	select {
-	case <-c.closeCh:
-		return false
-	default:
-	}
-	select {
-	case c.sendCh <- data:
-		return true
-	case <-c.closeCh:
-		return false
-	default:
-		// Buffer full — slow client. Drop and close.
-		c.Close(int(protocol.ClosePolicyViolation), "send buffer full")
-		return false
-	}
-}
-
-// writeFrame serializes one frame through a pooled buffer and writes it in a
-// single syscall. A non-zero deadline bounds control-frame writes; it is
-// cleared afterwards so it cannot leak onto subsequent data writes.
-func (c *wsConn) writeFrame(f ws.Frame, deadline time.Duration) error {
-	buf := frameBufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	err := ws.WriteFrame(buf, f)
-	if err == nil {
-		c.writeMu.Lock()
-		if deadline > 0 {
-			_ = c.conn.SetWriteDeadline(time.Now().Add(deadline))
-		}
-		_, err = c.conn.Write(buf.Bytes())
-		if deadline > 0 {
-			_ = c.conn.SetWriteDeadline(time.Time{})
-		}
-		c.writeMu.Unlock()
-	}
-	if buf.Cap() <= maxPooledFrameBuf {
-		frameBufPool.Put(buf)
-	}
-	return err
-}
-
-// Close shuts down the connection once.
-func (c *wsConn) Close(code int, reason string) {
-	c.closeOnce.Do(func() {
-		cc := code
-		c.closeMu.Lock()
-		c.closeCode = &cc
-		c.closeReason = reason
-		c.closeMu.Unlock()
-		close(c.closeCh)
-		// Best-effort close frame; ignore errors.
-		_ = c.writeFrame(ws.NewCloseFrame(ws.NewCloseFrameBody(ws.StatusCode(code), reason)), time.Second)
-		_ = c.conn.Close()
-	})
-}
-
-// CloseCode returns the close code passed to the first Close call, if any.
-func (c *wsConn) CloseCode() *int {
-	c.closeMu.Lock()
-	defer c.closeMu.Unlock()
-	return c.closeCode
-}
-
-// CloseReason returns the close reason passed to the first Close call, if any.
-func (c *wsConn) CloseReason() string {
-	c.closeMu.Lock()
-	defer c.closeMu.Unlock()
-	return c.closeReason
-}
-
-func (c *wsConn) IP() string { return c.ip }
-
-// readMessage returns the next complete data message, answering pings,
-// refreshing the keepalive deadline on pongs, and reassembling fragments
-// inline. Control frames never reach the caller.
-func (c *wsConn) readMessage() (ws.OpCode, []byte, error) {
-	var (
-		frag    []byte
-		fragOp  ws.OpCode
-		fragged bool
-	)
-	for {
-		h, err := ws.ReadHeader(c.rd)
-		if err != nil {
-			return 0, nil, err
-		}
-		if h.Length < 0 || h.Length > c.maxFrame || int64(len(frag))+h.Length > c.maxFrame {
-			return 0, nil, errFrameTooLarge
-		}
-		var payload []byte
-		if h.Length > 0 {
-			payload = make([]byte, h.Length)
-			if _, err := io.ReadFull(c.rd, payload); err != nil {
-				return 0, nil, err
-			}
-			if h.Masked {
-				ws.Cipher(payload, h.Mask, 0)
-			}
-		}
-		switch h.OpCode {
-		case ws.OpPing:
-			if err := c.writeFrame(ws.NewPongFrame(payload), time.Second); err != nil {
-				return 0, nil, err
-			}
-		case ws.OpPong:
-			_ = c.conn.SetReadDeadline(time.Now().Add(c.pingEvery * 3))
-		case ws.OpClose:
-			code, text := ws.StatusNoStatusRcvd, ""
-			if len(payload) >= 2 {
-				code = ws.StatusCode(uint16(payload[0])<<8 | uint16(payload[1]))
-				text = string(payload[2:])
-			}
-			return 0, nil, &closeError{code: int(code), text: text}
-		case ws.OpContinuation:
-			if !fragged {
-				return 0, nil, errProtocol
-			}
-			frag = append(frag, payload...)
-			if h.Fin {
-				return fragOp, frag, nil
-			}
-		case ws.OpText, ws.OpBinary:
-			if fragged {
-				return 0, nil, errProtocol
-			}
-			if h.Fin {
-				return h.OpCode, payload, nil
-			}
-			fragged, fragOp, frag = true, h.OpCode, append(frag, payload...)
-		default:
-			return 0, nil, errProtocol
-		}
-	}
-}
-
-// runReadLoop drives the read side: the handshake deadline, the ping/pong
-// handling, and dispatching inbound messages to the registry.
-func (c *wsConn) runReadLoop(s *Server, sess *room.Session) {
-	// Writer goroutine.
-	go c.writeLoop()
-
-	defer func() {
-		s.registry.Detach(sess)
-		s.registry.DecConnections()
-		s.metrics.ConnectionsLive.Dec()
-		c.Close(int(protocol.CloseProtocolError), "read loop exit")
-		// Emit a final ws log entry capturing the close code and reason so
-		// operators can see why each connection ended — including closes
-		// initiated by the registry (e.g. close-room → 4013) that bypass
-		// the per-message Result.CloseCode path.
-		if s.reqLog != nil {
-			s.reqLog.LogWS(c.ip, "close", "", "", "", nil, c.CloseCode(), 0, 0, c.CloseReason())
-		}
-	}()
-
-	handshakeDone := false
-
-	for {
-		op, raw, err := c.readMessage()
-		if err != nil {
-			// Handshake timeout surfaces as a read deadline error.
-			if !handshakeDone && isTimeout(err) {
-				_ = c.sendError(protocol.ErrHandshakeTimeout, "handshake timeout", "")
-				c.Close(int(protocol.CloseProtocolError), "handshake timeout")
-			} else if isCloseError(err) {
-				// Client-initiated close or network error; record the
-				// reason for the final close log entry.
-				c.Close(int(protocol.CloseProtocolError), "client disconnected: "+err.Error())
-			} else {
-				c.Close(int(protocol.CloseProtocolError), "read error: "+err.Error())
-			}
-			return
-		}
-		if op == ws.OpBinary {
-			// Binary frames are a protocol error.
-			_ = c.sendError(protocol.ErrMalformedMessage, "binary frames not allowed", "")
-			c.Close(int(protocol.CloseProtocolError), "binary frame rejected")
-			return
-		}
-		// Reset the read deadline to the ping-based keepalive once attached.
-		// Before the handshake, the deadline stays at the handshake timeout.
-
-		msgStart := time.Now()
-		env, result := s.dispatch(sess, c, raw)
-		if result.Response != nil {
-			body, mErr := json.Marshal(result.Response)
-			if mErr == nil {
-				c.Send(body)
-			}
-			if errResp, ok := result.Response.(protocol.ErrorResponse); ok {
-				s.metrics.RecordError(int(errResp.ErrorCode))
-			}
-		}
-		s.logWS(c.ip, len(raw), env, result, time.Since(msgStart))
-		if result.CloseCode != nil {
-			c.Close(*result.CloseCode, "policy")
-			return
-		}
-
-		if !handshakeDone {
-			handshakeDone = true
-			// Switch to ping-based keepalive deadline.
-			_ = c.conn.SetReadDeadline(time.Now().Add(c.pingEvery * 3))
-		}
-	}
-}
-
-func (c *wsConn) writeLoop() {
-	pingTicker := time.NewTicker(c.pingEvery)
-	defer pingTicker.Stop()
-
-	for {
-		select {
-		case <-c.closeCh:
-			return
-		case msg := <-c.sendCh:
-			if err := c.writeFrame(ws.NewTextFrame(msg), 0); err != nil {
-				c.Close(int(protocol.CloseProtocolError), "write error")
-				return
-			}
-		case <-pingTicker.C:
-			if err := c.writeFrame(ws.NewPingFrame(nil), time.Second); err != nil {
-				return
-			}
-		}
-	}
-}
-
-func (c *wsConn) sendError(code protocol.ErrorCode, msg, reqID string) error {
-	body, _ := json.Marshal(protocol.NewError(code, msg, reqID, nil))
-	c.Send(body)
-	return nil
-}
-
-func isTimeout(err error) bool {
-	if err == nil {
-		return false
-	}
-	var ne interface{ Timeout() bool }
-	if errors.As(err, &ne) {
-		return ne.Timeout()
-	}
-	return false
-}
-
-// isCloseError reports whether err is a WebSocket close error (i.e. the peer
-// sent a close frame or the connection was cleanly closed).
-func isCloseError(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-		return true
-	}
-	var ce *closeError
-	return errors.As(err, &ce)
 }
