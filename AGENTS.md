@@ -21,7 +21,9 @@ client in `docs/DESIGN.md`.
 - `src/internal/metrics/` — Prometheus instruments.
 - `src/internal/requestlog/` — JSON request logging (HTTP + WebSocket).
 - `src/internal/server/` — WebSocket endpoint, origin check, handshake timeout,
-  read/write loops, `/healthz`, `/metrics`.
+  `/healthz`, `/metrics`, and the WebSocket transport: framing over gobwas/ws
+  (`wsconn.go`), epoll-driven reads (`poller_linux.go`) with a
+  goroutine-per-connection fallback (`poller_other.go`, `readloop.go`).
 
 ## Build / test
 

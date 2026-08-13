@@ -4,9 +4,11 @@ Measurements of how far one signaling process goes on a 1 vCPU / 512 MB
 instance, and where its memory actually goes. Run on 2026-08-12.
 
 The short version: this server is **memory-bound, not CPU-bound**, and the
-memory is dominated by fixed per-socket overhead rather than by anything
-proportional to signaling traffic. At 10 000 concurrent sockets the process
-sits at ~15% of one core. It dies of memory long before it runs out of CPU.
+memory was dominated by fixed per-socket overhead rather than by anything
+proportional to signaling traffic. Removing that overhead — the hijacked
+`http.conn`, the WebSocket library's per-connection buffers, and both
+per-connection goroutines — took a socket from 27.9 KB to **9.3 KB** and the
+ceiling of a 512 MB instance from ~15 000 sockets to **55 000**.
 
 ## Test setup
 
@@ -23,10 +25,11 @@ by running out of memory rather than by shedding load — the point is to find
 where the ceiling is, not to confirm that a cap works. See
 [Sizing the caps](#sizing-the-caps) for what to actually deploy.
 
-Go 1.25.5; gorilla/websocket v1.5.3; gobwas/ws v1.4.0. "Peak RSS" is the
-container's `memory.current`, so it includes kernel socket memory charged to
-the cgroup, not just the Go heap. Per-socket figures divide by concurrent
-sockets and therefore fold in the ~25 MB the process uses at rest.
+Go 1.25.5; gobwas/ws v1.4.0 (gorilla/websocket v1.5.3 remains as the test
+client). "Peak RSS" is the container's `memory.current`, so it includes kernel
+socket memory charged to the cgroup, not just the Go heap. Per-socket figures
+divide by concurrent sockets and therefore fold in the ~25 MB the process uses
+at rest.
 
 Load generator caveats, since they shape what the numbers can support:
 
@@ -36,15 +39,23 @@ Load generator caveats, since they shape what the numbers can support:
   up as server-side failures that are not the server's fault.
 - `X-Forwarded-For` supplies distinct client IPs so the per-IP handshake limit
   (10/min, burst 20, hardcoded in `room.New`) does not bound the test.
+- Held sockets need a reader from the moment they are created: gorilla answers
+  server pings from inside `ReadMessage`, so a socket nobody is reading misses
+  two pongs and is closed — correctly — for keepalive timeout. An earlier
+  version of the generator only started its readers after the ramp, which made
+  every run with a ramp longer than 90 s under-report live sockets.
 - The sub-1% failures in the throughput runs are generator-side saturation,
   not server rejections: `signal_rate_limit_rejections_total` is 0 and the
   errors are client dial failures.
 
-## Where the memory goes
+## Where the memory went
 
-At 10 000 idle sockets, a heap profile of the pre-fix server attributed **42%
-of sampled heap to `bufio.NewReaderSize` and `bufio.NewWriterSize`** — more
-than every signaling structure combined:
+Four costs were paid by every socket for its whole life, none of them
+proportional to how much signaling it did. In the order they were removed:
+
+**1. The hijacked `http.conn` (7.9 KB/socket).** A heap profile at 10 000 idle
+sockets attributed **42% of sampled heap to `bufio.NewReaderSize` and
+`bufio.NewWriterSize`** — more than every signaling structure combined:
 
 ```
 22.08MB 22.35%  bufio.NewWriterSize
@@ -57,67 +68,106 @@ Those are net/http's buffers for the hijacked connection. `handleSignal` ran
 the read loop inline, so the handler goroutine never returned, net/http could
 never discard the `http.conn`, and each socket pinned a 4 KB `bufio.Reader`
 plus a 4 KB `bufio.Writer` for its entire life. Running the read loop on its
-own goroutine (`go c.runReadLoop(s, sess)`) lets the conn become garbage. The
-goroutine count is unchanged — the handler goroutine exits where it used to
-block.
+own goroutine lets the conn become garbage.
 
-This was the single largest win, and it is independent of the WebSocket
-library.
+**2. gorilla's per-connection read buffer (3.5 KB/socket).** Replacing
+gorilla/websocket with gobwas/ws, which is a framing library rather than a
+connection type, means frames are parsed straight off the `net.Conn` with no
+buffered reader parked on an idle socket.
+
+**3. The writer goroutine and its send channel (4.9 KB/socket).** Every
+connection had a second goroutine draining a 64-slot buffered channel — 1.6 KB
+for the channel, the rest stack — to guarantee that `Send` never blocks under
+the room mutex. A non-blocking `syscall.Write` gives the same guarantee for
+nothing: the write either completes, which it does for a signaling message
+against an empty socket buffer, or returns EAGAIN, and only then is a pending
+buffer and a drain goroutine allocated.
+
+**4. The read goroutine (8.2 KB/socket).** A goroutine parked in `Read` holds
+an 8 KB stack that is never given back: Go does not shrink the stack of a
+goroutine blocked in netpoll, and three forced GCs at 10 000 sockets moved
+`StackInuse` not at all. Readability now comes from one epoll instance for the
+whole process (`EPOLLONESHOT`), and a message is handled on a goroutine that
+exits when the socket is drained. Stacks went from 82.4 MB to 0.5 MB and the
+process from 20 006 goroutines to **8**.
 
 ## 10 000 concurrent idle sockets
 
-`hold` mode: 10 000 half-open rooms, 40s ramp, 30s hold. All runs 100%
+`hold` mode: 10 000 half-open rooms, 40 s ramp, 30 s hold. All runs 100%
 success.
 
-| Build | Peak RSS | Per socket | Heap in use | Stack in use |
-|---|---|---|---|---|
-| gorilla, blocking handler | 366.4 MB | 36.6 KB | 190.6 MB | 117.6 MB |
-| gobwas, blocking handler | 348.7 MB | 34.9 KB | 172.4 MB | 116.8 MB |
-| **gorilla, non-blocking handler** | **287.1 MB** | **28.7 KB** | 103.3 MB | 117.6 MB |
-| gobwas, non-blocking handler | 247.6 MB | 24.8 KB | 85.5 MB | 99.2 MB |
+| Build | Peak RSS | Per socket | Goroutines |
+|---|---|---|---|
+| gorilla, blocking handler | 366.4 MB | 36.6 KB | 20 006 |
+| **gorilla, non-blocking handler** (shipped) | **279.1 MB** | **27.9 KB** | 20 006 |
+| gobwas | 244.2 MB | 24.4 KB | 20 006 |
+| gobwas + epoll, fallback path | 214.2 MB | 21.4 KB | 10 007 |
+| **gobwas + epoll** | **110.6 MB** | **11.1 KB** | **8** |
 
-Reading the rows against each other:
+The last two rows are the same code. The fourth is it forced onto its fallback
+path — a goroutine per connection, no epoll — which is what a TLS connection or
+a non-Linux build gets (see [Fallback](#fallback-path)). The gap between them
+is what the poller is worth: 10.3 KB per socket, all of it goroutine.
 
-- **Releasing the `http.conn` saves 7.9 KB/socket** (366.4 → 287.1 MB), almost
-  all of it heap. This is the change that shipped.
-- **Swapping gorilla for gobwas saves 1.8 KB/socket on its own** (366.4 →
-  348.7 MB) — modest, because pooling the write buffer and shrinking the read
-  buffer to 1 KB had already recovered most of what the swap would give.
-- **Its benefit grows to 4.0 KB/socket once the http buffers are gone** (287.1
-  → 247.6 MB): 1.8 KB of heap plus ~1.9 KB of goroutine stack, gobwas's read
-  path being shallower than gorilla's.
-
-Both libraries hold 20 006 goroutines for 10 000 sockets — two per connection,
-a read loop and a writer.
-
-## Throughput and CPU
-
-`pair` mode at 600 rooms/s for 30s, sockets closed at pairing so memory stays
-bounded. Both builds have the non-blocking handler.
-
-| Build | Completed | Throughput | Signals relayed | CPU |
-|---|---|---|---|---|
-| gorilla | 17 820 | 594.0 rooms/s | 320 760 | 69.4% of a core |
-| gobwas | 17 822 | 594.0 rooms/s | 320 796 | 67.8% of a core |
-
-Identical work, and the difference is inside run-to-run noise. Neither the
-non-blocking handler nor gobwas costs measurable CPU. In particular, gobwas
-reads frame headers straight off the `net.Conn` with no buffered reader — the
-extra syscall per frame header does not show up at this rate.
+Between the first and last row, one socket costs 3.3x less. Nothing about the
+signaling protocol changed.
 
 ## Capacity ceiling
 
-`hold` mode at 15 000 sockets, 60s ramp:
+`hold` mode, ramped to the stated size and held 30 s:
 
-| Build | Result | Peak RSS |
-|---|---|---|
-| gorilla, blocking handler | **OOM-killed at ~13 700 sockets** (93.1% success) | 512 MB (limit) |
-| gorilla, non-blocking handler | 15 000, 100% success | 412.6 MB |
-| gobwas, non-blocking handler | 15 000, 100% success | 378.6 MB |
+| Build | Sockets | Result | Peak RSS |
+|---|---|---|---|
+| gorilla, blocking handler | 15 000 | **OOM-killed at ~13 700** (93.1%) | 512 MB (limit) |
+| gorilla, non-blocking handler | 15 000 | 100% success | 412.6 MB |
+| gobwas + epoll | 30 000 | 100% success | 297.3 MB |
+| gobwas + epoll | 45 000 | 100% success | 407.6 MB |
+| gobwas + epoll | 55 000 | 100% success | 509.5 MB |
 
-The shipped fix is sufficient to clear 15 000 sockets on a 512 MB instance.
-gobwas buys headroom beyond that, not the capability itself — which is why the
-port is parked on `experiment/gobwas-ws` rather than merged.
+55 000 sockets is the edge — 509.5 MB against a 512 MB limit, with no headroom
+for a GC cycle that arrives at a bad moment. 45 000 is the last size with room
+to spare.
+
+At 45 000 the run also produced two `1302 could not allocate room id` errors.
+That is the room ID allocator running out of retries against 45 000 live rooms,
+not a memory or transport limit, and it is the first non-memory ceiling this
+server will hit as capacity grows.
+
+## Throughput and CPU
+
+`pair` mode at 600 rooms/s for 30 s, sockets closed at pairing so memory stays
+bounded. All builds have the non-blocking handler.
+
+| Build | Throughput | Signals relayed | CPU |
+|---|---|---|---|
+| gorilla | 597.6 rooms/s | 322 866 | 70.0% of a core |
+| gobwas | 599.1 rooms/s | 323 550 | 69.9% of a core |
+| gobwas + epoll | 596.9 rooms/s | 323 424 | 72.4% of a core |
+
+The library swap is free. **The epoll transport costs ~2.5 points of a core**
+at this rate, and a CPU profile says where: `epoll_ctl` (the one-shot re-arm)
+and `epoll_wait` are ~4% of samples, against the goroutine-per-connection
+model's zero. Spawning a goroutine per readable event does not show up.
+
+For scale, `syscall.write` is 29% of CPU at this rate and `encoding/json` is
+another 25%, so the transport is not where this server spends its time. It is
+a good trade for a server whose binding constraint is memory: 2.5% CPU for 3x
+the sockets.
+
+## Fallback path
+
+The poller needs a file descriptor, so a TLS connection terminated in-process
+cannot use it, and neither can a non-Linux build. Both fall back to a goroutine
+per connection sharing all the same parsing (`poller_other.go`, `readloop.go`).
+That path measured 214.2 MB at 10 000 sockets — better than the shipped build,
+worse than epoll by 2x.
+
+It also has a trap worth recording: a blocking read loop holds its read buffer
+for the life of the connection, so taking that buffer from the shared pool
+pinned 16 KB per socket and cost 55 MB at 10 000 sockets (269.1 MB before the
+fix). Buffer lifetime has to match the path: pooled and 16 KB for an event
+goroutine that holds it for one message, owned and 4 KB for a loop that parks
+in `Read` with it.
 
 ## What this means for deployment
 
@@ -133,40 +183,40 @@ This model held to within 1% across runs (30 rooms/s at grace 60 predicted
 3900 sockets, measured 3896; 150 rooms/s at grace 10 predicted 4500, measured
 4476).
 
-At ~28.7 KB/socket, 15 000 sockets measured good at 412.6 MB, and a
-conservative operating budget of **12 000 sockets** (~370 MB, leaving headroom
-for GC and burst traffic), one instance sustains roughly:
+At ~9.3 KB/socket, 45 000 sockets measured good at 407.6 MB, and a conservative
+operating budget of **40 000 sockets** (~370 MB, leaving headroom for GC and
+burst traffic), one instance sustains roughly:
 
 | `PEER_CONNECTED_GRACE_SEC` | Sockets held | Sustainable arrival rate | Bound by |
 |---|---|---|---|
-| 60 (default) | rate × 130 | ~90 rooms/s | memory (CPU ~11%) |
-| 10 | rate × 30 | ~400 rooms/s | memory (CPU ~46%) |
+| 60 (default) | rate × 130 | ~300 rooms/s | memory (CPU ~37%) |
+| 10 | rate × 30 | ~850 rooms/s | CPU |
 | 1 | rate × 12 | ~850 rooms/s | CPU |
 
-**The grace period is a ~9× capacity knob**, and by far the cheapest one
-available. Nothing else in the configuration comes close. It also decides
-*which* resource binds: at the default the instance is memory-saturated and
-nearly CPU-idle, and only below ~2s does CPU become the limit.
+**The instance is now CPU-bound below a ~20 s grace period**, where before it
+was memory-bound almost everywhere. The grace period is still the cheapest
+capacity knob available, but it has stopped being the only one that matters:
+above ~850 rooms/s, JSON and write syscalls are the wall.
 
-The CPU-bound figure is extrapolated from the measured 594 rooms/s at 69% of a
+The CPU-bound figure is extrapolated from the measured 597 rooms/s at 72% of a
 core, not measured directly — above ~600 rooms/s the load generator was near
 its own limit, so the true ceiling is bounded below by ~600 and estimated at
 ~850. Treat it as an order of magnitude, not a target.
 
 ### Sizing the caps
 
-`MAX_CONNECTIONS_GLOBAL` defaults to 100 000, but 512 MB holds 15 000 sockets
-measured, ~17 000 extrapolated to the limit. The protective cap therefore sits
-~6× above the real ceiling and never fires — the process is OOM-killed instead
-of shedding load, taking every live room with it.
+`MAX_CONNECTIONS_GLOBAL` defaults to 100 000, but 512 MB holds 55 000 sockets
+measured. The protective cap therefore still sits ~2x above the real ceiling
+and never fires — the process would be OOM-killed instead of shedding load,
+taking every live room with it.
 
 Sized to the instance, the server survives overload *and* delivers higher
 throughput, because rejecting excess connections with HTTP 503 is far cheaper
 than GC-thrashing against the memory limit. For a 512 MB instance:
 
 ```
-MAX_CONNECTIONS_GLOBAL=12000
-MAX_ROOMS_GLOBAL=6000
+MAX_CONNECTIONS_GLOBAL=40000
+MAX_ROOMS_GLOBAL=20000
 GOMEMLIMIT=400MiB
 ```
 
@@ -177,8 +227,17 @@ killed anyway. The connection cap is what keeps the live set small enough for
 
 ## Remaining headroom
 
-After both changes, the largest single item is **goroutine stacks: ~10–12 KB
-per socket**, two goroutines per connection, which is 40%+ of the total.
-Eliminating the per-connection writer goroutine would outweigh the entire
-gorilla→gobwas swap. That is the next thing to try if per-socket memory
-becomes binding again.
+There is no longer a large fixed per-socket cost to remove. Of the ~9.3 KB a
+socket now costs, most is kernel socket memory charged to the cgroup and Go
+heap for room state; `newWSConn` itself is ~1 MB of sampled heap at 10 000
+sockets, down from 12 MB.
+
+The next constraints, in the order they will bite:
+
+1. **Room ID allocation** — collisions and retry exhaustion appear at ~45 000
+   live rooms (`1302`), well before memory does.
+2. **CPU under signaling load** — `encoding/json` is ~25% of profile samples.
+   Relaying the raw signal payload without re-encoding it would be the largest
+   single saving.
+3. **Per-message write syscalls** — 29% of samples, one `write` per message.
+   Only coalescing across messages would reduce it, which trades latency.

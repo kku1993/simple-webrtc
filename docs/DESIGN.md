@@ -150,10 +150,10 @@ Framing rules:
 
 - Text frames only. A binary frame is a protocol error (close `4001`).
 - Each frame must contain exactly one JSON object.
-- Maximum frame size is **64 KB** (`maxFrameBytes`). This must be enforced by
-  the WebSocket library at the frame level so oversized frames are rejected
-  without being buffered into memory. A typical SDP offer is 4–8 KB, so this is
-  already generous.
+- Maximum frame size is **64 KB** (`maxFrameBytes`). This is enforced at the
+  frame level, from the length in the frame header, so an oversized frame is
+  rejected without its payload ever being buffered. A typical SDP offer is
+  4–8 KB, so this is already generous.
 - The server sends a WebSocket ping every 30 s (`pingIntervalSec`) and closes
   the connection if two consecutive pongs are missed. This is the primary
   mechanism for detecting half-open TCP connections.
@@ -986,10 +986,12 @@ Single instance. No load balancer configuration is required beyond TLS
 termination and WebSocket upgrade passthrough.
 
 Sizing: a room holds two sockets and a few KB of state, and connected rooms are
-released from memory entirely. A 1 vCPU / 512 MB instance comfortably handles
-well over 10 000 concurrent rooms; the binding constraints are file descriptors
-(raise `ulimit -n`) and bandwidth, and signaling traffic is only tens of KB per
-room in total.
+released from memory entirely. A socket costs ~9 KB all-in, so a 1 vCPU /
+512 MB instance holds 45 000 of them with headroom and 55 000 at the edge — see
+[Load test results](LOAD_TEST_RESULTS.md), which also covers what to set the
+protective caps to. The binding constraints are file descriptors (raise
+`ulimit -n`) and bandwidth; signaling traffic is only tens of KB per room in
+total.
 
 Avoid platforms that price long-lived WebSockets per connection-minute. A small
 always-on VM is dramatically cheaper for this workload.
