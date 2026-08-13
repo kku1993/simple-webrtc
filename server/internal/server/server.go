@@ -32,9 +32,22 @@ import (
 // explicitly in handleSignal via cfg.OriginAllowed before the upgrade; relying
 // on gorilla's default would reject legitimate cross-origin requests even when
 // ALLOWED_ORIGINS permits them (including "*").
+// writeBufferPool shares write buffers across connections. A signaling server
+// holds far more idle sockets than concurrently-writing ones -- after both
+// peers report connected a room's sockets sit idle for peerConnectedGraceSec
+// -- so a per-connection write buffer is paid for by every socket but used by
+// almost none at any instant.
+var writeBufferPool = &sync.Pool{}
+
+// Buffers are sized for the traffic this server actually carries: SDP
+// offers/answers of a few KB and ICE candidates of a few hundred bytes. A
+// smaller read buffer costs an extra read syscall on the larger SDP frames and
+// saves that memory on every concurrent socket, which is the binding
+// constraint at scale.
 var defaultUpgrader = websocket.Upgrader{
-	ReadBufferSize:  4096,
+	ReadBufferSize:  1024,
 	WriteBufferSize: 4096,
+	WriteBufferPool: writeBufferPool,
 	CheckOrigin:     func(*http.Request) bool { return true },
 }
 
