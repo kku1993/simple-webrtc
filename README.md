@@ -32,6 +32,12 @@ The server requires a `SERVER_SECRET` (>=32 bytes), an `ALLOWED_ORIGINS`
 allowlist, and a `SHARD_NAME` (a single alphabetic Crockford base32 character,
 `a-z` excluding `i`, `l`, `o`, `u`); it refuses to start without them.
 
+Each server process is one **shard**. Rooms live in that process's memory, and
+`SHARD_NAME` becomes the first character of every room id it mints, so a room id
+names the process that owns it. Production runs several shards and points
+clients at them with a [manifest](#shard-manifest); a single shard is enough for
+local development.
+
 ```sh
 SERVER_SECRET="$(openssl rand -base64 32)" \
 ALLOWED_ORIGINS="http://localhost:5173,https://your.app" \
@@ -90,6 +96,10 @@ await guest.joinRoom({ roomId });
 
 Notes:
 
+- `url` is the single-endpoint shorthand, good for a local server. Production
+  deployments pass `manifest` instead, so clients discover shards and TURN
+  credentials at runtime — see [Shard manifest](#shard-manifest). Exactly one of
+  the two is required.
 - The host's peer is built only after `guest-joined` fires; the guest's is
   built immediately on `joinRoom`. Don't construct one yourself — pass ICE
   configuration via `PeerConnectionOptions.rtc`.
@@ -109,6 +119,171 @@ Notes:
   // later, e.g. in a React useEffect cleanup:
   off();
   ```
+
+## Shard manifest
+
+The signaling backend is a set of single-process shards. A room lives entirely
+in one process's memory, and the shard's `SHARD_NAME` is the first character of
+every room id it mints — so a room id names the process that owns it.
+
+Clients find those processes through a **manifest**: a JSON config file served
+from a URL you control.
+
+- The **host always loads the manifest before creating a room** and picks a
+  shard by weighted random choice. Load balancing is therefore a config change,
+  not a deploy.
+- The **guest loads the same manifest and picks the shard that owns the room id**
+  it was given, so it lands on the process holding the room.
+- The manifest is also the client's config file: it carries the ICE/TURN
+  servers, so credentials and relay policy rotate server-side.
+
+### Manifest format
+
+```json
+{
+  "version": 1,
+  "shards": [
+    { "name": "t", "url": "wss://t.signal.example/v1/signal", "weight": 3 },
+    { "name": "k", "url": "wss://k.signal.example/v1/signal", "weight": 1 },
+    { "name": "m", "url": "wss://m.signal.example/v1/signal", "weight": 0 }
+  ],
+  "iceServers": [
+    { "urls": "stun:stun.l.google.com:19302" },
+    {
+      "urls": ["turn:turn.example.org:3478"],
+      "username": "rotating-user",
+      "credential": "rotating-credential"
+    }
+  ],
+  "iceTransportPolicy": "all",
+  "settings": { "anything": "your app wants" }
+}
+```
+
+| Field | Meaning |
+| --- | --- |
+| `version` | Schema version. Currently `1`; a client refuses a manifest newer than it understands. Optional, defaults to `1`. |
+| `shards[].name` | The shard's `SHARD_NAME` — the room-id prefix it owns. `"*"` is a wildcard that matches every room id. |
+| `shards[].url` | The shard's WebSocket endpoint. Must be `ws://` or `wss://`. |
+| `shards[].weight` | Relative share of **new** rooms. Optional, defaults to `1`. `0` drains the shard. |
+| `iceServers` | `RTCIceServer[]` applied to every peer connection. |
+| `iceTransportPolicy` | `"all"` (default) or `"relay"` to force traffic through TURN. |
+| `settings` | Opaque application config. The client never reads it; get it from `peer.currentManifest?.settings`. |
+
+A copy of this example lives at `docs/signal-manifest.example.json`.
+
+Room ids are normalized (Crockford base32 fuzzy decoding) before the shard
+lookup, so a user typing `T1A230` reaches the same shard as `t1a230`. The
+shard whose `name` is the **longest** matching prefix wins, and a `"*"` entry is
+consulted only when no named shard matches.
+
+### Pointing clients at it
+
+```ts
+const peer = new PeerConnection({
+  manifest: { url: "https://config.example.com/signal-manifest.json" },
+});
+```
+
+Serve the file from any static host or CDN. Two requirements:
+
+- **CORS**: the manifest is fetched with `fetch()` from your app's origin, so
+  the response needs `Access-Control-Allow-Origin` for that origin.
+- **Cache headers**: pick a `max-age` you are willing to wait when draining a
+  shard. The client also caches in memory for `ttlMs` (default 60s).
+
+Full options:
+
+```ts
+const peer = new PeerConnection({
+  manifest: {
+    url: "https://config.example.com/signal-manifest.json",
+    ttlMs: 60_000,       // reuse a fetched manifest this long (default 60s)
+    timeoutMs: 5_000,    // per-request timeout (default 5s)
+    fallback: LOCAL_MANIFEST, // used if the very first fetch fails
+    // fetch: customFetch,    // inject your own fetch (tests, auth headers)
+  },
+});
+```
+
+If a **refresh** fails, the client keeps using the last manifest it loaded —
+losing the config server does not take down clients that already know where the
+shards are. If the **first** load fails, the `fallback` is used when configured;
+otherwise `createRoom()` / `joinRoom()` reject with a `ManifestError` before any
+socket is opened.
+
+### Static config for local testing
+
+Pass the manifest in memory instead of fetching it. This is the recommended
+shape for local development and tests — same code path, no config server:
+
+```ts
+import { PeerConnection, type SignalManifest } from "@simple-webrtc/client";
+
+const LOCAL_MANIFEST: SignalManifest = {
+  version: 1,
+  shards: [{ name: "t", url: "ws://localhost:8080/v1/signal" }],
+};
+
+const peer = new PeerConnection({ manifest: { static: LOCAL_MANIFEST } });
+```
+
+A static manifest is validated eagerly, so a malformed one throws from the
+`PeerConnection` constructor rather than at connect time. Selecting the shard
+for a static manifest involves no I/O, so `createRoom()` opens its socket in the
+same tick — identical to passing `url` directly, which is just sugar for a
+one-wildcard-shard manifest.
+
+### Operating it
+
+- **Add a shard**: start the process with a fresh `SHARD_NAME`, then add its
+  entry to the manifest. New rooms start arriving as clients pick up the change.
+- **Drain a shard**: set its `weight` to `0`. No new rooms are placed there, but
+  guests holding an existing room id are still routed to it, so live rooms
+  finish normally. Take the process down after your room TTL has elapsed.
+- **Reweight**: weights are relative, not percentages — `3` and `1` send 75% /
+  25% of new rooms.
+- **Never reuse a `SHARD_NAME` for a different endpoint** while rooms may still
+  exist on the old one; the room id is the only routing key.
+- A connection **pins its shard for its lifetime**. Reconnects and
+  `rejoin(session)` return to the same shard, because that is where the room is
+  — a manifest edit never moves a live room.
+
+### TURN through the manifest
+
+`iceServers` in the manifest are applied to every peer generation, including
+peers rebuilt after a reconnect, so rotated TURN credentials take effect without
+an app deploy. Anything the application passes in `rtc.config` wins over the
+manifest, per field:
+
+```ts
+const peer = new PeerConnection({
+  manifest: { url: "https://config.example.com/signal-manifest.json" },
+  // Overrides the manifest's iceServers; iceTransportPolicy still comes
+  // from the manifest.
+  rtc: { config: { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] } },
+});
+```
+
+See [TURN guidance](#turn-guidance) for choosing and verifying TURN servers.
+
+### Inspecting the resolution
+
+```ts
+peer.currentShard;     // { name: "k", url: "wss://k.signal.example/v1/signal", weight: 1 } | null
+peer.signalUrl;        // "wss://k.signal.example/v1/signal" | null
+peer.currentManifest;  // the SignalManifest in force, incl. `settings` | null
+```
+
+For tests, `shardRandom` replaces `Math.random` in weighted selection:
+
+```ts
+new PeerConnection({ manifest: { static: M }, shardRandom: () => 0 }); // always the first shard
+```
+
+The pieces are exported standalone too — `parseManifest`, `ManifestProvider`,
+`selectShard`, `shardForRoomId`, `singleShardManifest`, `applyManifestRtcConfig`,
+and `ManifestError` — if you want to resolve or validate a manifest yourself.
 
 ## Data channels
 
@@ -425,6 +600,7 @@ prefer the wrapper-level media and channel methods for ordinary use.
 - `package.json` — root package face for `@simple-webrtc/client` (installed via GitHub release tarballs).
 - `scripts/` — `build.sh` (Go server binary), `release-client.sh` (client release tarball).
 - `docs/DESIGN.md` — protocol, state machine, and configuration reference.
+- `docs/signal-manifest.example.json` — example client manifest (shard directory + ICE config).
 
 ## Building from source
 

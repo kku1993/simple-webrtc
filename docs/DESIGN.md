@@ -1007,10 +1007,24 @@ total.
 Avoid platforms that price long-lived WebSockets per connection-minute. A small
 always-on VM is dramatically cheaper for this workload.
 
-If a second instance ever becomes necessary, the natural extension is to run
-it with a different `SHARD_NAME` and route on the first character of `roomId`
-at the edge. The protocol is already compatible with this — `roomId` is
-server-assigned and opaque to clients — so no message format would change.
+### Multiple shards
+
+Scaling out means running more single-process instances, each with its own
+`SHARD_NAME`, and routing on the first character of `roomId`. No message format
+changes — `roomId` is server-assigned and opaque to clients.
+
+Routing is done **in the client**, not at the edge: the client fetches a JSON
+manifest listing every shard (name, URL, weight) from a URL the operator
+controls. A host loads it before creating a room and picks a shard by weighted
+random choice; a guest loads it and picks the shard whose name prefixes the
+room id it was given. The manifest also carries the ICE/TURN configuration, so
+it doubles as the client's config file.
+
+This keeps the edge dumb (TLS termination and WebSocket upgrade passthrough,
+nothing more) and makes rebalancing and draining a config change rather than a
+deploy. The format, hosting requirements, and operational procedures are in the
+README under "Shard manifest"; an example manifest is at
+`docs/signal-manifest.example.json`.
 
 ### Operational endpoints
 

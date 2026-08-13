@@ -16,6 +16,16 @@ import { type RoomSession, type SessionStore, RoomSessionStore, MemorySessionSto
 import { Transport, type WebSocketFactory, type WebSocketLike } from './transport.js';
 import { SequenceCounter, generateEpoch, generateRequestId, fullJitterBackoff } from './util.js';
 import { normalizeRoomId } from './roomid.js';
+import {
+  type ManifestOptions,
+  type ShardEntry,
+  type SignalManifest,
+  ManifestProvider,
+  applyManifestRtcConfig,
+  selectShard,
+  shardForRoomId,
+  singleShardManifest,
+} from './manifest.js';
 import { RtcPeer } from './rtc/peer.js';
 import { DataChannelHandle } from './rtc/channel-handle.js';
 import { assertUsableLabel, resolveSpec } from './rtc/channels.js';
@@ -32,6 +42,7 @@ export type { Logger } from './logger.js';
 export * from './types.js';
 export * from './storage.js';
 export type { WebSocketFactory, WebSocketLike } from './transport.js';
+export * from './manifest.js';
 
 // ---------------------------------------------------------------------------
 // Public option / result types
@@ -88,8 +99,36 @@ export interface RtcPeerLike {
 export type RtcPeerFactory = (opts: RtcPeerOptions) => RtcPeerLike;
 
 export interface PeerConnectionOptions {
-  /** WebSocket URL of the signaling endpoint, e.g. `wss://host/v1/signal`. */
-  url: string;
+  /**
+   * WebSocket URL of a single signaling endpoint, e.g. `wss://host/v1/signal`.
+   *
+   * Use this only for single-shard deployments and quick experiments. It is
+   * exactly equivalent to a {@link manifest} holding one wildcard shard.
+   * Mutually exclusive with {@link manifest}; exactly one of the two is required.
+   */
+  url?: string;
+  /**
+   * Where to load the client manifest from — the shard directory plus ICE/TURN
+   * configuration. See {@link ManifestOptions}.
+   *
+   * ```ts
+   * // production: fetch the live config
+   * manifest: { url: "https://cdn.example/signal-manifest.json" }
+   * // local testing: a config object compiled into the app
+   * manifest: { static: { version: 1, shards: [{ name: "t", url: "ws://localhost:8080/v1/signal" }] } }
+   * ```
+   *
+   * The manifest is loaded before the first handshake: the host picks a shard
+   * by weighted random choice, and the guest picks the shard that owns the room
+   * id it is joining. Mutually exclusive with {@link url}.
+   */
+  manifest?: ManifestOptions;
+  /**
+   * Source of randomness for weighted shard selection, returning a number in
+   * `[0, 1)`. Defaults to `Math.random`; override to make host placement
+   * deterministic in tests.
+   */
+  shardRandom?: () => number;
   /** Options forwarded to every internal {@link RtcPeer} (ICE config, SDP hooks). */
   rtc?: RtcOptions;
   /**
@@ -282,6 +321,9 @@ export type PeerDestroyedReason = 'rebuild' | 'close' | 'user-close' | 'terminal
 
 type HandshakeKind = 'create' | 'join' | 'rejoin';
 
+/** What a shard is being resolved for: a brand new room, or an existing one. */
+type ShardIntent = { create: true } | { roomId: string };
+
 interface HandshakeRequest {
   kind: HandshakeKind;
   requestId: string;
@@ -321,10 +363,16 @@ interface DesiredTrackEntry {
  */
 export class PeerConnection extends Emitter<PeerConnectionEvents> {
   private readonly opts: {
-    url: string;
     maxReconnectAttempts: number;
   };
   private readonly rtcOpts: RtcOptions;
+  /** Shard directory + ICE config loader. */
+  private readonly manifests: ManifestProvider;
+  private readonly shardRandom: () => number;
+  /** The manifest in force for this connection, once loaded. */
+  private manifest: SignalManifest | null = null;
+  /** The shard this connection is pinned to, once resolved. */
+  private shard: ShardEntry | null = null;
   private readonly declaredChannels: Record<string, DataChannelSpec>;
   private readonly sessionStore: RoomSessionStore;
   private readonly transport: Transport;
@@ -391,9 +439,21 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
   constructor(opts: PeerConnectionOptions) {
     super();
     this.opts = {
-      url: opts.url,
       maxReconnectAttempts: opts.maxReconnectAttempts ?? Infinity,
     };
+    if (opts.url !== undefined && opts.manifest !== undefined) {
+      throw new TypeError(
+        'PeerConnection: pass either `url` (single endpoint) or `manifest` (shard directory), not both',
+      );
+    }
+    if (opts.url === undefined && opts.manifest === undefined) {
+      throw new TypeError('PeerConnection: one of `url` or `manifest` is required');
+    }
+    this.shardRandom = opts.shardRandom ?? Math.random;
+    this.manifests = new ManifestProvider(
+      opts.manifest ?? { static: singleShardManifest(opts.url!) },
+      opts.logger ?? {},
+    );
     this.rtcOpts = opts.rtc ?? {};
     this.declaredChannels = opts.dataChannels ?? {};
     this.sessionStore = new RoomSessionStore(opts.store ?? new MemorySessionStore());
@@ -445,6 +505,25 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
     return this.peer;
   }
 
+  /**
+   * The manifest this connection resolved its shard from, or `null` before the
+   * first handshake. Applications can read `manifest.settings` for their own
+   * operator-managed configuration.
+   */
+  get currentManifest(): SignalManifest | null {
+    return this.manifest ?? this.manifests.cached;
+  }
+
+  /** The shard this connection is pinned to, or `null` before the first handshake. */
+  get currentShard(): ShardEntry | null {
+    return this.shard;
+  }
+
+  /** The signaling URL currently in use, or `null` before the first handshake. */
+  get signalUrl(): string | null {
+    return this.shard?.url ?? null;
+  }
+
   /** True once the P2P connection is established. */
   get connected(): boolean {
     return this.peer?.connected ?? false;
@@ -483,6 +562,10 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
     guestPassword?: string;
     cloudflareTurnstileToken?: string;
   } = {}): Promise<CreateRoomResult> {
+    // The host always consults the manifest before creating a room: shard
+    // placement is decided by operator-set weights, not baked into the client.
+    const pendingShard = this.ensureShard({ create: true });
+    if (pendingShard) await pendingShard;
     const hostEpoch = generateEpoch();
     const message: ClientMessage = {
       type: 'create-room',
@@ -518,6 +601,9 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
     // (case-insensitive, O→0, I→1, L→1) without rejecting malformed ids —
     // the backend owns validation. See docs/ROOM_ID_SPEC.md §"Frontend handling".
     const roomId = normalizeRoomId(input.roomId);
+    // The room id names its shard, so the guest reaches the process holding it.
+    const pendingShard = this.ensureShard({ roomId });
+    if (pendingShard) await pendingShard;
     const message: ClientMessage = {
       type: 'join-room',
       roomId,
@@ -543,6 +629,10 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
    * since a reloaded page has lost its WebRTC session.
    */
   async rejoin(session: RoomSession): Promise<RejoinResult> {
+    // A reload lost the resolved shard along with everything else; recover it
+    // from the persisted room id.
+    const pendingShard = this.ensureShard({ roomId: session.roomId });
+    if (pendingShard) await pendingShard;
     const epoch = generateEpoch();
     // Capture the previous other-epoch BEFORE applyHandshakeResponse overwrites
     // the persisted session, so the epoch-change comparison is correct.
@@ -886,11 +976,59 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
     });
   }
 
+  // -------------------------------------------------------------------------
+  // Shard resolution
+  // -------------------------------------------------------------------------
+
+  /**
+   * Pin this connection to a shard, loading the manifest if needed.
+   *
+   * The host resolves by weighted random choice over the manifest's shards; the
+   * guest (and any rejoin) resolves by the room id's shard prefix, so it lands
+   * on the process that owns the room. Resolution happens once per connection:
+   * a reconnect must return to the same shard, since that is where the room
+   * lives.
+   *
+   * Returns `null` when the shard was resolved without I/O — a static manifest
+   * or a warm cache — and a promise only when the manifest has to be fetched.
+   * Callers await it conditionally, so a client that already holds its config
+   * opens its socket in the same tick it was asked to and the manifest adds
+   * latency only to the path that actually needs the network.
+   */
+  private ensureShard(intent: ShardIntent): Promise<void> | null {
+    if (this.shard) return null;
+    const cached = this.manifests.cached;
+    if (cached) {
+      this.pinShard(cached, intent);
+      return null;
+    }
+    return this.manifests.get().then((manifest) => {
+      // A concurrent caller may have pinned in the meantime.
+      if (!this.shard) this.pinShard(manifest, intent);
+    });
+  }
+
+  private pinShard(manifest: SignalManifest, intent: ShardIntent): void {
+    this.manifest = manifest;
+    const shard =
+      'create' in intent
+        ? selectShard(manifest, this.shardRandom)
+        : shardForRoomId(manifest, intent.roomId);
+    this.shard = shard;
+    this.log.info?.('resolved signaling shard', { shard: shard.name, url: shard.url });
+  }
+
   private async handshake(kind: HandshakeKind, message: ClientMessage): Promise<ServerMessage> {
     if (this.terminal) throw new SignalingError(0, 'PeerConnection is terminal', { retryable: false });
     this.setStatus('connecting');
     if (!this.transportOpen()) {
-      await this.transport.connect(this.opts.url);
+      const shard = this.shard;
+      if (!shard) {
+        throw new SignalingError(0, 'No signaling shard resolved for this connection', {
+          retryable: false,
+        });
+      }
+      await this.transport.connect(shard.url);
     }
     const requestId = generateRequestId();
     const toSend: ClientMessage = { ...message, requestId };
@@ -1105,8 +1243,12 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
   private maybeBuildPeer(opts: { initiator: boolean }): boolean {
     if (this.peer) return false;
     const initiator = opts.initiator;
+    // ICE servers from the manifest are operator-managed defaults; anything the
+    // application set in `rtc.config` wins.
+    const config = applyManifestRtcConfig(this.manifest, this.rtcOpts.config);
     const peer = this.createPeer({
       ...this.rtcOpts,
+      ...(config !== undefined ? { config } : {}),
       initiator,
       dataChannels: this.declaredChannels,
       // The same handle map for every generation, so application references
@@ -1457,6 +1599,18 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
       rejoinToken: this.state.rejoinToken,
       epoch,
     };
+    // Normally a no-op: the shard was pinned on the first handshake and a
+    // reconnect must return to the same one. Only a connection that never
+    // resolved one can reach the manifest here, so a failure is retryable.
+    try {
+      const pendingShard = this.ensureShard({ roomId: this.state.roomId });
+      if (pendingShard) await pendingShard;
+    } catch (e) {
+      this.triggerReconnect(
+        new SignalingError(0, 'Failed to resolve signaling shard', { cause: e, retryable: true }),
+      );
+      return;
+    }
     try {
       const res = (await this.handshake('rejoin', message)) as RejoinRoomResponse;
       this.applyHandshakeResponse(res, {

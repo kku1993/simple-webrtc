@@ -84,6 +84,28 @@ export { Transport, type WebSocketFactory, type WebSocketLike, parseFrame } from
 
 export { normalizeRoomId } from './roomid.js';
 
+// The client manifest: shard directory + ICE/TURN configuration.
+export {
+  ManifestProvider,
+  ManifestError,
+  parseManifest,
+  singleShardManifest,
+  selectShard,
+  shardForRoomId,
+  applyManifestRtcConfig,
+  WILDCARD_SHARD,
+  MANIFEST_VERSION,
+  DEFAULT_MANIFEST_TTL_MS,
+  DEFAULT_MANIFEST_TIMEOUT_MS,
+  type SignalManifest,
+  type ShardEntry,
+  type ManifestOptions,
+  type RemoteManifestOptions,
+  type StaticManifestOptions,
+  type ManifestFetch,
+  type ManifestResponseLike,
+} from './manifest.js';
+
 export {
   generateEpoch,
   generateRequestId,

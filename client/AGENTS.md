@@ -15,7 +15,7 @@ that drove it.
 - `npm run build` — `tsc -p tsconfig.build.json` → emits ESM + declarations to `dist/`.
 - `npm run typecheck` — `tsc -p tsconfig.json --noEmit` (covers `src` + `test`).
 - `npm run lint` — `eslint .` (flat config, type-checked).
-- `npm test` — `node --test --import tsx test/*.test.ts` (168 tests; uses a
+- `npm test` — `node --test --import tsx test/*.test.ts` (196 tests; uses a
   fake WebSocket, a fake peer, and a fake `RTCPeerConnection` — no browser and
   no native WebRTC needed).
 
@@ -45,6 +45,15 @@ Two layers:
    the signaling protocol.
 2. `src/peer-connection.ts` — `PeerConnection`, the protocol state machine. Owns
    rooms, epochs, reconnect, and the desired-media / channel-handle registries.
+
+`src/manifest.ts` sits beside both: it turns an operator-authored JSON config
+into a signaling URL (weighted random choice for a host creating a room,
+room-id prefix lookup for a guest joining one) and an `RTCConfiguration`. A
+connection pins its shard for its lifetime — a reconnect must return to the
+process holding the room. `PeerConnection`'s `url` option is sugar for a
+one-wildcard-shard manifest, and shard resolution stays synchronous whenever the
+manifest is already in hand, so a statically configured client opens its socket
+in the same tick it was asked to.
 
 ### Engine (`src/rtc/`)
 
@@ -96,6 +105,9 @@ engine instead, pass `rtcImpl` and use the doubles in `test/rtc-fakes.ts`.
 
 - `test/fakes.ts` — fake WebSocket + `FakePeer` (an `RtcPeerLike` stub) for
   protocol tests.
+- `test/manifest.test.ts` — manifest parsing, weighted selection, room-id →
+  shard lookup, the caching loader (stale-on-refresh-failure, fallback,
+  single-flight), and the `PeerConnection` wiring.
 - `test/rtc-fakes.ts` — `FakePeerConnection` / `FakeDataChannel` for engine
   tests. The fake maintains a real `signalingState` machine, so negotiation
   ordering and queueing are genuinely exercised.

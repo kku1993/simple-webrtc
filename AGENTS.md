@@ -82,6 +82,9 @@ than depending on `simple-peer` — see `docs/RTC_ENGINE_PLAN.md`. Full notes in
 - `client/src/logger.ts` — the shared `Logger` interface.
 - `client/src/roomid.ts` — frontend room id normalization (Crockford base32
   fuzzy decoding, no validation; backend owns rejection).
+- `client/src/manifest.ts` — the client manifest: shard directory (weighted
+  selection for hosts, room-id prefix lookup for guests) plus ICE/TURN config,
+  loaded from a URL or a static object. See README §"Shard manifest".
 - `client/src/index.ts` — public barrel.
 - `client/test/` — `node:test` suite. `fakes.ts` provides a fake WebSocket and a
   fake peer for protocol tests; `rtc-fakes.ts` provides a fake
@@ -100,7 +103,7 @@ npm install-scripts approve esbuild   # one-off: unblock tsx's postinstall
 npm run build       # tsc -p tsconfig.build.json  -> dist/
 npm run typecheck   # tsc -p tsconfig.json --noEmit (src + test)
 npm run lint        # eslint .  (flat config, type-checked)
-npm test            # node --test --import tsx test/*.test.ts (168 tests)
+npm test            # node --test --import tsx test/*.test.ts (196 tests)
 ```
 
 The client has **no runtime dependencies**. Keep it that way.
@@ -148,6 +151,10 @@ The client has **no runtime dependencies**. Keep it that way.
   reliability, declared via `dataChannels` or opened at runtime. The initiator
   creates them and the responder binds by label, so the two sides cannot
   disagree about a channel's configuration.
+- Shard selection from a client manifest (`manifest: {url}` fetched, or
+  `{static}` in memory): hosts pick by weight before `create-room`, guests and
+  rejoins pick by the room id's shard prefix, and the shard is pinned for the
+  life of the connection. `url` remains supported as a one-shard shorthand.
 - `PeerConnection` accepts injectable `transportFactory` and `peerFactory`
   options so the state machine is unit-testable without a browser or native
   WebRTC.
