@@ -445,6 +445,13 @@ func (c *wsConn) onReadable(scratch []byte) bool {
 	c.rmu.Lock()
 	defer c.rmu.Unlock()
 
+	// Bytes left from an earlier read may already complete a message -- the
+	// client pipelined it behind the handshake, say -- and nothing further need
+	// ever arrive to prompt another read.
+	if len(c.rbuf) > 0 && !c.consume(nil) {
+		return false
+	}
+
 	for {
 		n, err := c.readOnce(scratch)
 		if n > 0 {

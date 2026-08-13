@@ -1,9 +1,14 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -11,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gobwas/ws"
 	"github.com/gorilla/websocket"
 	"github.com/kku1993/simple-webrtc-server/internal/config"
 	"github.com/kku1993/simple-webrtc-server/internal/metrics"
@@ -578,5 +584,60 @@ func TestServerFragmentedMessage(t *testing.T) {
 	}
 	if sr["data"] != data {
 		t.Errorf("reassembled payload does not match")
+	}
+}
+
+// TestServerPipelinedFirstMessage sends the WebSocket handshake and the first
+// message in a single write. Those bytes land in net/http's buffered reader
+// rather than the socket, so nothing further arrives to make the connection
+// readable -- the transport has to notice what it already holds.
+func TestServerPipelinedFirstMessage(t *testing.T) {
+	hs, _ := newTestServer(t, testConfig())
+
+	addr := strings.TrimPrefix(hs.URL, "http://")
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	key := base64.StdEncoding.EncodeToString(make([]byte, 16))
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "GET /v1/signal HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\n"+
+		"Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n",
+		addr, key)
+	body, _ := json.Marshal(map[string]any{"type": "create-room", "hostEpoch": "h1"})
+	frame := ws.MaskFrame(ws.NewTextFrame(body))
+	if err := ws.WriteFrame(&buf, frame); err != nil {
+		t.Fatalf("WriteFrame: %v", err)
+	}
+	if _, err := conn.Write(buf.Bytes()); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("status = %d, want 101", resp.StatusCode)
+	}
+
+	h, err := ws.ReadHeader(br)
+	if err != nil {
+		t.Fatalf("read frame header: %v", err)
+	}
+	payload := make([]byte, h.Length)
+	if _, err := io.ReadFull(br, payload); err != nil {
+		t.Fatalf("read payload: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(payload, &m); err != nil {
+		t.Fatalf("unmarshal %q: %v", payload, err)
+	}
+	if m["type"] != "create-room-response" {
+		t.Fatalf("got %v, want create-room-response", m["type"])
 	}
 }
