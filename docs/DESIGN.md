@@ -75,18 +75,18 @@ Room IDs minted by this server follow `docs/ROOM_ID_SPEC.md` (mirrored from the
   is assigned to the backend instance via the `SHARD_NAME` config and
   identifies the shard so a future load balancer can route by the first
   character. The server refuses to start without a valid `SHARD_NAME`.
-- **nid** — 5 characters: the first is a Crockford base32 digit
-  (`[0-9a-z]` excluding `i`, `l`, `o`, `u`) and the remaining four are base 10
-  (`[0-9]`). Only one base32 digit is used to avoid accidentally spelling a
-  bad word. The nid is randomly generated on room creation.
+- **nid** — 5 characters: the first and last are Crockford base32 digits
+  (`[0-9a-z]` excluding `i`, `l`, `o`, `u`) and the middle three are base 10
+  (`[0-9]`). The two base32 digits are separated by base 10 digits so a nid
+  cannot spell a bad word. The nid is randomly generated on room creation.
 
 On input, Crockford base32 fuzzy decoding rules apply (`O→0`, `I→1`, `L→1`,
 case-insensitive); the canonical form is always lowercase. See
 <https://www.crockford.com/base32.html>.
 
 The whole ID uses only `[0-9a-z]`, a subset of the protocol's allowed
-`[0-9a-z_-]`. The entropy is far below 128 bits (32 first-nid digits × 10⁴
-= 320k possibilities per shard); uniqueness is provided by the
+`[0-9a-z_-]`. The entropy is far below 128 bits (32 × 10³ × 32
+= 1,024,000 possibilities per shard); uniqueness is provided by the
 collision-checked generation with up to 5 retries, **not** by entropy. This is
 an explicit trade-off of brevity/typeability over unguessability: the `roomId`
 is not a secret — the signed `rejoinToken` (256-bit MAC) is the bearer

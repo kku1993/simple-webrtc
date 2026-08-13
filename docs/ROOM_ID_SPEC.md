@@ -49,9 +49,12 @@ loadbalancer logic simple - avoid teaching it base32 fuzzy decoding logic.
 
 ### nid
 
-This is a 5 digit number - the first digit is base32 while the rest are base 10.
+This is a 5 digit number - the first and last digits are base32 while the
+middle three are base 10.
 
-- We only use 1 base32 number to avoid accidentially creating a bad word.
+- The two base32 digits are separated by base 10 digits so a nid cannot
+  accidentially spell a bad word.
+- This gives a pool of 32 × 10³ × 32 = 1,024,000 nids per shard.
 - The backend should randomly generate the nid on room creation.
 - If there's a collision, backend should retry up to 5 times before returning an error.
 - After a room is retired/expired, `nid` can be reused.

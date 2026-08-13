@@ -10,9 +10,9 @@
 //   - shard is a single alphabetic Crockford base32 character
 //     (digits [0-9] are reserved for future use). It identifies the backend
 //     shard so a future load balancer can route by the first character.
-//   - nid is 5 characters: the first is a Crockford base32 digit and the
-//     remaining four are base 10 (0-9). Only one base32 digit is used to
-//     avoid accidentally spelling a bad word.
+//   - nid is 5 characters: the first and last are Crockford base32 digits
+//     and the middle three are base 10 (0-9). The two base32 digits are kept
+//     apart by base-10 digits so a nid cannot spell a bad word.
 //
 // On input, Crockford base32 fuzzy decoding rules apply (O→0, I→1, L→1,
 // case-insensitive); the canonical form is always lowercase. See
@@ -35,8 +35,8 @@ const base32Alphabet = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 // characters. Digits are reserved for future use per the room ID spec.
 const base32Alphabetic = "ABCDEFGHJKMNPQRSTVWXYZ"
 
-// NIDLength is the length of the nid portion: 1 base32 digit + 4 base-10
-// digits.
+// NIDLength is the length of the nid portion: 1 base32 digit + 3 base-10
+// digits + 1 base32 digit.
 const NIDLength = 5
 
 // RoomIDLength is the total room id length: 1 shard char + nid.
@@ -111,16 +111,22 @@ func ParseRoomID(id string) (ParsedRoomID, bool) {
 	if !ok {
 		return ParsedRoomID{}, false
 	}
-	// Remaining 4 nid digits are base 10 (0-9), with Crockford fuzzy
+	// The middle 3 nid digits are base 10 (0-9), with Crockford fuzzy
 	// decoding mapping O→0, I→1, L→1.
 	nid := strings.ToLower(nidFirstDecoded)
-	for i := 2; i < RoomIDLength; i++ {
+	for i := 2; i < RoomIDLength-1; i++ {
 		decoded, ok := DecodeBase32Char(id[i])
 		if !ok || len(decoded) != 1 || decoded[0] < '0' || decoded[0] > '9' {
 			return ParsedRoomID{}, false
 		}
 		nid += strings.ToLower(decoded)
 	}
+	// The last nid digit is base32, like the first.
+	nidLastDecoded, ok := DecodeBase32Char(id[RoomIDLength-1])
+	if !ok {
+		return ParsedRoomID{}, false
+	}
+	nid += strings.ToLower(nidLastDecoded)
 	return ParsedRoomID{Shard: shardLower, NID: nid}, true
 }
 
@@ -182,22 +188,27 @@ func Generate(shard string, exists func(id string) bool) (string, error) {
 }
 
 // candidate builds a single [shard][nid] string. The nid is 1 random base32
-// digit + 4 random base-10 digits, drawn from crypto/rand.
+// digit + 3 random base-10 digits + 1 random base32 digit, drawn from
+// crypto/rand.
 func candidate(shardLower string) (string, error) {
 	nidFirst, err := randomBase32Char()
 	if err != nil {
 		return "", err
 	}
-	rest, err := randomDecimalDigits(4)
+	middle, err := randomDecimalDigits(3)
 	if err != nil {
 		return "", err
 	}
-	return shardLower + nidFirst + rest, nil
+	nidLast, err := randomBase32Char()
+	if err != nil {
+		return "", err
+	}
+	return shardLower + nidFirst + middle + nidLast, nil
 }
 
 // randomBase32Char returns one random Crockford base32 character (lowercase),
 // drawn from crypto/rand. The full alphabet (including digits) is used for
-// the nid's first position per the room ID spec.
+// the nid's first and last positions per the room ID spec.
 func randomBase32Char() (string, error) {
 	var b [1]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -215,7 +226,7 @@ func randomDecimalDigits(n int) (string, error) {
 		return "", err
 	}
 	// 256 % 10 == 6, so digits 0-5 are very slightly over-represented. For
-	// a 4-digit collision-absorbing suffix this bias is negligible and well
+	// a 3-digit collision-absorbing middle this bias is negligible and well
 	// below the cost of rejection sampling.
 	for i, b := range buf {
 		buf[i] = byte('0' + int(b)%10)

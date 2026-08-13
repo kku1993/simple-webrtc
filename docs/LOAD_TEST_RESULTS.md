@@ -137,17 +137,54 @@ signaling protocol changed.
 | gobwas + epoll | 30 000 | 100% success | 297.3 MB |
 | gobwas + epoll | 45 000 | 100% success | 407.6 MB |
 | gobwas + epoll | 55 000 | 100% success | 509.5 MB |
+| gobwas + epoll | 65 000 | **OOM-killed at ~58 500** (90.6%) | 512 MB (limit) |
 
 55 000 sockets is the edge — 509.5 MB against a 512 MB limit, with no headroom
 for a GC cycle that arrives at a bad moment. 45 000 is the last size with room
-to spare.
+to spare. A run ramped at 65 000 puts the true wall at **~58 500 sockets**:
+the container hits its limit and the process is OOM-killed (exit 137,
+`OOMKilled: true`), after which every remaining dial is refused.
 
-At 45 000 and above, runs intermittently produce one or two
-`1302 could not allocate room id` errors out of 45 000 creates -- two of the
-three runs at that size did, one did not. That is the room ID allocator running
-out of retries against a room table that large, not a memory or transport
-limit, and it is the first non-memory ceiling this server will hit as capacity
-grows.
+## The room ID ceiling
+
+At 45 000 and above, runs used to intermittently produce one or two
+`1302 could not allocate room id` errors -- two of the three runs at 45 000
+did, one did not. That was the room ID allocator running out of its 5 retries
+against a room table that large, not a memory or transport limit, and it was
+the first non-memory ceiling this server hit as capacity grew.
+
+Widening the nid's **last** digit from base 10 to Crockford base32, matching
+its first digit, took the pool per shard from 32 × 10⁴ = 320 000 to
+32 × 10³ × 32 = **1 024 000** (see `docs/ROOM_ID_SPEC.md`). Retry exhaustion
+is quintic in occupancy — with `p` of the pool taken, a create fails only if
+all 5 candidates collide, at rate `p⁵` — so 3.2x the pool is 3.2⁵ ≈ **340x**
+fewer failures at the same room count:
+
+| Live rooms | Occupancy (old / new) | Expected `1302` per full ramp (old / new) |
+|---|---|---|
+| 45 000 | 14.1% / 4.4% | 2.5 / 0.007 |
+| 55 000 | 17.2% / 5.4% | 8.4 / 0.025 |
+
+Measured, same 55 000-socket `hold` run on both builds:
+
+| Build | `1302` errors | Peak RSS |
+|---|---|---|
+| 4-digit nid (old) | 1 | 496.1 MB |
+| base32 last digit (new) | 0 | 478.6 MB |
+| base32 last digit (new), repeat | 0 | 493.1 MB |
+
+A clean 45 000 run on the new build also showed 0 (485.5 MB). Keeping retry
+exhaustion under 1 in 10⁵ creates needs occupancy below ~10%, which is
+102 400 live rooms on the new pool against 32 000 on the old. **Room ID
+allocation has stopped being the binding ceiling**: it now sits at roughly
+1.8x the memory wall instead of well below it, and memory is once again what
+this server runs out of first.
+
+The peak RSS figures above are all within the ±10% run-to-run noise of each
+other and of the 509.5 MB in the table — the ID schema does not change the ID
+length, so it does not move memory. Note that the 55 000 run at 478.6 MB and
+the 45 000 run at 485.5 MB are in the wrong order relative to each other for
+exactly that reason: where the GC cycle lands dominates at this scale.
 
 ## Throughput and CPU
 
@@ -250,10 +287,13 @@ sockets, down from 12 MB.
 
 The next constraints, in the order they will bite:
 
-1. **Room ID allocation** — collisions and retry exhaustion appear at ~45 000
-   live rooms (`1302`), well before memory does.
-2. **CPU under signaling load** — `encoding/json` is ~25% of profile samples.
+1. **Memory** — the process is OOM-killed at ~58 500 sockets on 512 MB, and
+   there is no longer a large fixed per-socket cost to remove.
+2. **Room ID allocation** — no longer binding after the nid's last digit went
+   base32 (see [The room ID ceiling](#the-room-id-ceiling)); the pool is good
+   past 100 000 live rooms, well above the memory wall.
+3. **CPU under signaling load** — `encoding/json` is ~25% of profile samples.
    Relaying the raw signal payload without re-encoding it would be the largest
    single saving.
-3. **Per-message write syscalls** — 29% of samples, one `write` per message.
+4. **Per-message write syscalls** — 29% of samples, one `write` per message.
    Only coalescing across messages would reduce it, which trades latency.

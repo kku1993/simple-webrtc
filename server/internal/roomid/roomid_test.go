@@ -7,8 +7,8 @@ import (
 )
 
 // validID matches [shard][nid]: 1 alphabetic base32 shard char + 1 base32
-// digit + 4 base-10 digits, all lowercase.
-var validID = regexp.MustCompile(`^[abcdefghjkmnpqrstvwxyz][0-9a-z][0-9]{4}$`)
+// digit + 3 base-10 digits + 1 base32 digit, all lowercase.
+var validID = regexp.MustCompile(`^[abcdefghjkmnpqrstvwxyz][0-9a-z][0-9]{3}[0-9a-z]$`)
 
 // TestShard used throughout the suite — a single alphabetic Crockford base32
 // char, lowercase.
@@ -97,12 +97,40 @@ func TestParseRoomID_RejectsNonBase32Shard(t *testing.T) {
 	}
 }
 
-func TestParseRoomID_RejectsNonBase10InLastFour(t *testing.T) {
+func TestParseRoomID_RejectsNonBase10InMiddleThree(t *testing.T) {
 	if _, ok := ParseRoomID("tab123"); ok { // 'b' is not a base10 digit
 		t.Errorf("ParseRoomID(tab123) ok, want false")
 	}
-	if _, ok := ParseRoomID("ta00aa"); ok {
-		t.Errorf("ParseRoomID(ta00aa) ok, want false")
+	if _, ok := ParseRoomID("ta00a0"); ok {
+		t.Errorf("ParseRoomID(ta00a0) ok, want false")
+	}
+}
+
+func TestParseRoomID_AcceptsAnyBase32LastNIDDigit(t *testing.T) {
+	// The last nid digit is base32, like the first.
+	for _, tc := range []struct{ in, wantNID string }{
+		{"ta000z", "a000z"},
+		{"ta000Z", "a000z"},
+		{"ta000b", "a000b"},
+		{"ta000O", "a0000"}, // Crockford fuzzy: O -> 0
+		{"ta000L", "a0001"}, // Crockford fuzzy: L -> 1
+	} {
+		got, ok := ParseRoomID(tc.in)
+		if !ok {
+			t.Fatalf("ParseRoomID(%q) not ok", tc.in)
+		}
+		if got.NID != tc.wantNID {
+			t.Errorf("ParseRoomID(%q).NID = %q, want %q", tc.in, got.NID, tc.wantNID)
+		}
+	}
+}
+
+func TestParseRoomID_RejectsNonBase32LastNIDDigit(t *testing.T) {
+	// 'u' is excluded from the Crockford alphabet, '-' is not base32 at all.
+	for _, in := range []string{"ta000u", "ta000-"} {
+		if _, ok := ParseRoomID(in); ok {
+			t.Errorf("ParseRoomID(%q) ok, want false", in)
+		}
 	}
 }
 
@@ -160,7 +188,7 @@ func TestNormalizeRoomID(t *testing.T) {
 		t.Errorf("NormalizeRoomID(TZ9999) = %q, ok=%v, want %q", got, ok, "tz9999")
 	}
 	// Malformed ids return false.
-	for _, in := range []string{"ta000", "ta00000", "ia0000", "tab123", "not-an-id", ""} {
+	for _, in := range []string{"ta000", "ta00000", "ia0000", "tab123", "ta000u", "not-an-id", ""} {
 		if got, ok := NormalizeRoomID(in); ok {
 			t.Errorf("NormalizeRoomID(%q) = %q, ok=true, want false", in, got)
 		}
@@ -252,10 +280,10 @@ func TestGenerate_InvalidShard(t *testing.T) {
 }
 
 func TestGenerate_Distribution(t *testing.T) {
-	// Sanity: over many draws, the nid first digit (32 possibilities) and
-	// the 4 base-10 digits give a 320k space. With 5000 draws the birthday
-	// paradox expects ~39 collisions (~4961 distinct); allow a comfortable
-	// margin so this isn't flaky.
+	// Sanity: over many draws, the nid's two base32 digits (32 each) and
+	// the 3 base-10 digits between them give a 1,024,000 space. With 5000
+	// draws the birthday paradox expects ~12 collisions (~4988 distinct);
+	// allow a comfortable margin so this isn't flaky.
 	seen := make(map[string]struct{}, 5000)
 	for i := 0; i < 5000; i++ {
 		id, err := Generate(testShard, func(string) bool { return false })
@@ -264,7 +292,7 @@ func TestGenerate_Distribution(t *testing.T) {
 		}
 		seen[id] = struct{}{}
 	}
-	if len(seen) < 4900 {
-		t.Fatalf("expected ~4960 distinct IDs, got %d", len(seen))
+	if len(seen) < 4950 {
+		t.Fatalf("expected ~4988 distinct IDs, got %d", len(seen))
 	}
 }
