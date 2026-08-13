@@ -454,8 +454,11 @@ func (c *wsConn) onReadable(scratch []byte) bool {
 			}
 		}
 		switch {
-		case err == nil && n > 0:
-			// The socket may hold more; keep reading until it is drained.
+		case err == nil && n == len(scratch):
+			// The buffer filled, so there is probably more waiting. A short
+			// read means the socket is empty and reading again would only buy
+			// an EAGAIN: epoll is level-triggered, so anything still queued is
+			// reported again by the re-arm.
 			continue
 		case err == nil:
 			return true
