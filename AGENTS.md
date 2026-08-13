@@ -25,6 +25,9 @@ client in `docs/DESIGN.md`.
   (`wsconn.go`), epoll-driven reads (`poller_linux.go`) with a
   goroutine-per-connection fallback (`poller_other.go`, `readloop.go`).
 
+- `loadtest/` — containerized load test harness (generator + runner). See
+  `loadtest/README.md`; results live in `docs/LOAD_TEST_RESULTS.md`.
+
 ## Build / test
 
 ```sh
@@ -85,7 +88,10 @@ than depending on `simple-peer` — see `docs/RTC_ENGINE_PLAN.md`. Full notes in
   `RTCPeerConnection` and `RTCDataChannel` for engine tests. No browser or
   native WebRTC needed.
 
-### Build / test
+#- `loadtest/` — containerized load test harness (generator + runner). See
+  `loadtest/README.md`; results live in `docs/LOAD_TEST_RESULTS.md`.
+
+## Build / test
 
 ```sh
 cd client

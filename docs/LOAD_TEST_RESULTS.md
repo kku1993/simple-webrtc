@@ -25,11 +25,25 @@ by running out of memory rather than by shedding load — the point is to find
 where the ceiling is, not to confirm that a cap works. See
 [Sizing the caps](#sizing-the-caps) for what to actually deploy.
 
+Everything here is reproducible with the harness in
+[`loadtest/`](../loadtest/README.md), which is what produced it:
+
+```sh
+cd loadtest && ./build.sh
+./run.sh -mode hold -rooms 10000 -ramp 40s -hold 30s
+```
+
 Go 1.25.5; gobwas/ws v1.4.0 (gorilla/websocket v1.5.3 remains as the test
 client). "Peak RSS" is the container's `memory.current`, so it includes kernel
 socket memory charged to the cgroup, not just the Go heap. Per-socket figures
 divide by concurrent sockets and therefore fold in the ~25 MB the process uses
 at rest.
+
+Peak RSS moves by roughly ±10% between identical runs, depending on where a GC
+cycle lands relative to the once-a-second sampler — six repeats of the 10 000
+socket run on the final build gave 108.5, 109.0, 109.1, 110.8, 121.7 and
+133.7 MB. Figures below are representative runs, and the differences they are
+used to argue are much larger than that.
 
 Load generator caveats, since they shape what the numbers can support:
 
