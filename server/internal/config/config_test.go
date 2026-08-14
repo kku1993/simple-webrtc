@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"testing"
+	"time"
 )
 
 func setEnv(t *testing.T, k, v string) {
@@ -315,5 +316,81 @@ func TestLoadWithOverridesValidationStillRuns(t *testing.T) {
 	bad := -1
 	if _, err := LoadWithOverrides(FlagOverrides{MaxRoomsGlobal: &bad}); err == nil {
 		t.Fatalf("expected validation error for negative MaxRoomsGlobal override")
+	}
+}
+
+func TestLoadStateDefaults(t *testing.T) {
+	validBaseEnv(t)
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.StateDir != "" {
+		t.Errorf("StateDir = %q, want empty (disabled by default)", c.StateDir)
+	}
+	if c.StateFlushIntervalMs != 100 {
+		t.Errorf("StateFlushIntervalMs = %d, want 100", c.StateFlushIntervalMs)
+	}
+	if c.StateBatchSize != 256 {
+		t.Errorf("StateBatchSize = %d, want 256", c.StateBatchSize)
+	}
+	if c.StateEnabled() {
+		t.Errorf("StateEnabled should be false by default")
+	}
+}
+
+func TestLoadStateFromEnv(t *testing.T) {
+	validBaseEnv(t)
+	t.Setenv("STATE_DIR", "/tmp/webrtc-state")
+	t.Setenv("STATE_FLUSH_INTERVAL_MS", "250")
+	t.Setenv("STATE_BATCH_SIZE", "512")
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.StateDir != "/tmp/webrtc-state" {
+		t.Errorf("StateDir = %q, want /tmp/webrtc-state", c.StateDir)
+	}
+	if c.StateFlushIntervalMs != 250 {
+		t.Errorf("StateFlushIntervalMs = %d, want 250", c.StateFlushIntervalMs)
+	}
+	if c.StateBatchSize != 512 {
+		t.Errorf("StateBatchSize = %d, want 512", c.StateBatchSize)
+	}
+	if !c.StateEnabled() {
+		t.Errorf("StateEnabled should be true")
+	}
+	if c.StateFlushInterval() != 250*time.Millisecond {
+		t.Errorf("StateFlushInterval = %v, want 250ms", c.StateFlushInterval())
+	}
+}
+
+func TestLoadStateRejectsNonPositiveFlushInterval(t *testing.T) {
+	validBaseEnv(t)
+	t.Setenv("STATE_DIR", "/tmp/webrtc-state")
+	t.Setenv("STATE_FLUSH_INTERVAL_MS", "0")
+	if _, err := Load(); err == nil {
+		t.Fatalf("expected error for zero STATE_FLUSH_INTERVAL_MS with STATE_DIR set")
+	}
+}
+
+func TestLoadStateRejectsNonPositiveBatchSize(t *testing.T) {
+	validBaseEnv(t)
+	t.Setenv("STATE_DIR", "/tmp/webrtc-state")
+	t.Setenv("STATE_BATCH_SIZE", "0")
+	if _, err := Load(); err == nil {
+		t.Fatalf("expected error for zero STATE_BATCH_SIZE with STATE_DIR set")
+	}
+}
+
+func TestLoadStateDisabledSkipsValidation(t *testing.T) {
+	validBaseEnv(t)
+	// Without STATE_DIR, the flush/batch validation should not run even if
+	// those values are zero (they won't be — defaults apply — but the
+	// validation gate is what we're testing).
+	t.Setenv("STATE_FLUSH_INTERVAL_MS", "0")
+	t.Setenv("STATE_BATCH_SIZE", "0")
+	if _, err := Load(); err != nil {
+		t.Fatalf("Load should succeed when STATE_DIR is empty: %v", err)
 	}
 }

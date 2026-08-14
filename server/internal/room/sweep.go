@@ -16,12 +16,16 @@ func (r *Registry) StartSweep() {
 	go r.sweepLoop()
 }
 
-// Stop terminates the sweep goroutine. It is safe to call multiple times.
+// Stop terminates the sweep goroutine and flushes+closes the persister. It is
+// safe to call multiple times.
 func (r *Registry) Stop() {
 	select {
 	case <-r.stopCh:
 	default:
 		close(r.stopCh)
+	}
+	if r.persister != nil {
+		r.persister.Close()
 	}
 }
 
@@ -66,18 +70,21 @@ func (r *Registry) sweepRoom(room *Room, now time.Time) {
 	// Peer-connected grace release.
 	if room.releaseAt != nil && !now.Before(*room.releaseAt) {
 		r.releaseRoomLocked(room, "peer-connected", protocol.ClosePeerConnected)
+		r.markDeleted(room.roomID)
 		return
 	}
 
 	// Room expiry (in-memory lifetime or token TTL).
 	if !now.Before(room.expiresAt) {
 		r.expireRoomLocked(room)
+		r.markDeleted(room.roomID)
 		return
 	}
 
 	// Peer deadline: only when exactly one slot is occupied.
 	if room.peerDeadlineAt != nil && !now.Before(*room.peerDeadlineAt) {
 		r.expireRoomLocked(room)
+		r.markDeleted(room.roomID)
 		return
 	}
 }
@@ -116,7 +123,8 @@ func (r *Registry) releaseRoomLocked(room *Room, reason string, code protocol.Cl
 // Shutdown sends server-shutdown to every attached connection with a random
 // reconnectAfterMs in [1000, 15000] and closes it with 4300. Rooms are removed
 // from memory but NO tombstones are written (rejoin is still permitted while
-// tokens are valid).
+// tokens are valid). Room state files are NOT deleted — a restart can
+// rehydrate them so clients that reconnect after the shutdown can rejoin.
 func (r *Registry) Shutdown() {
 	r.mu.Lock()
 	rooms := make([]*Room, 0, len(r.rooms))
@@ -139,6 +147,8 @@ func (r *Registry) Shutdown() {
 		}
 		room.mu.Unlock()
 		r.removeRoomLocked(room)
+		// Do NOT markDeleted: the room state remains on disk so a restart
+		// can rehydrate it and clients can rejoin.
 	}
 }
 

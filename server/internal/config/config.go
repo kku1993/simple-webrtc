@@ -44,6 +44,13 @@ type Config struct {
 	MaxRoomsGlobal              int
 	MaxConnectionsGlobal        int
 	MaxRoomsPerIp               int
+
+	// State persistence. When StateDir is non-empty, room state is
+	// periodically flushed to JSON files in that directory so a restarted
+	// server can rehydrate live rooms. Empty disables persistence.
+	StateDir             string
+	StateFlushIntervalMs int
+	StateBatchSize       int
 }
 
 // FlagOverrides holds optional command-line overrides for every configurable
@@ -79,6 +86,9 @@ type FlagOverrides struct {
 	MaxRoomsGlobal                *int
 	MaxConnectionsGlobal          *int
 	MaxRoomsPerIp                 *int
+	StateDir                      *string
+	StateFlushIntervalMs          *int
+	StateBatchSize                *int
 }
 
 // Load reads configuration from the process environment, applies defaults, and
@@ -113,6 +123,8 @@ func LoadWithOverrides(o FlagOverrides) (Config, error) {
 		MaxConnectionsGlobal:          100000,
 		MaxRoomsPerIp:                 20,
 		TurnCredentialTtlSec:          14400, // 4 hours; matches internal/turn.DefaultTTL
+		StateFlushIntervalMs:          100,
+		StateBatchSize:                256,
 	}
 
 	get := func(key string, dst *string) {
@@ -212,6 +224,13 @@ func LoadWithOverrides(o FlagOverrides) (Config, error) {
 	if err := getInt("MAX_ROOMS_PER_IP", &c.MaxRoomsPerIp); err != nil {
 		return Config{}, err
 	}
+	get("STATE_DIR", &c.StateDir)
+	if err := getInt("STATE_FLUSH_INTERVAL_MS", &c.StateFlushIntervalMs); err != nil {
+		return Config{}, err
+	}
+	if err := getInt("STATE_BATCH_SIZE", &c.StateBatchSize); err != nil {
+		return Config{}, err
+	}
 
 	// Command-line overrides win over env vars and defaults. Applied after the
 	// env pass so a flag always takes precedence.
@@ -293,6 +312,15 @@ func LoadWithOverrides(o FlagOverrides) (Config, error) {
 	if o.MaxRoomsPerIp != nil {
 		c.MaxRoomsPerIp = *o.MaxRoomsPerIp
 	}
+	if o.StateDir != nil {
+		c.StateDir = *o.StateDir
+	}
+	if o.StateFlushIntervalMs != nil {
+		c.StateFlushIntervalMs = *o.StateFlushIntervalMs
+	}
+	if o.StateBatchSize != nil {
+		c.StateBatchSize = *o.StateBatchSize
+	}
 
 	return c, c.Validate()
 }
@@ -350,6 +378,14 @@ func (c Config) Validate() error {
 	}
 	if c.MaxRoomsGlobal <= 0 || c.MaxConnectionsGlobal <= 0 || c.MaxRoomsPerIp <= 0 {
 		return errors.New("capacity configs must be positive")
+	}
+	if c.StateDir != "" {
+		if c.StateFlushIntervalMs <= 0 {
+			return errors.New("STATE_FLUSH_INTERVAL_MS must be positive when STATE_DIR is set")
+		}
+		if c.StateBatchSize <= 0 {
+			return errors.New("STATE_BATCH_SIZE must be positive when STATE_DIR is set")
+		}
 	}
 	return nil
 }
@@ -417,4 +453,12 @@ func (c Config) OriginAllowed(origin string) bool {
 // origin check by setting ALLOWED_ORIGINS=*.
 func (c Config) OriginsCheckDisabled() bool {
 	return len(c.AllowedOrigins) == 1 && c.AllowedOrigins[0] == "*"
+}
+
+// StateEnabled reports whether disk persistence of room state is configured.
+func (c Config) StateEnabled() bool { return c.StateDir != "" }
+
+// StateFlushInterval returns the persister flush interval as a Duration.
+func (c Config) StateFlushInterval() time.Duration {
+	return time.Duration(c.StateFlushIntervalMs) * time.Millisecond
 }

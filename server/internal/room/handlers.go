@@ -164,6 +164,7 @@ func (r *Registry) CreateRoom(s *Session, m protocol.CreateRoomMsg, turnstileOK 
 	s.mu.Unlock()
 
 	r.metrics.RoomsCreated.Inc()
+	r.markDirty(roomID)
 
 	// Issue rejoin token.
 	tok, err := r.signer.Issue(token.Payload{
@@ -283,6 +284,7 @@ func (r *Registry) JoinRoom(s *Session, m protocol.JoinRoomMsg) Result {
 			GuestEpoch: m.GuestEpoch,
 		})
 	}
+	r.markDirty(room.roomID)
 
 	// Issue guest rejoin token (same createdAt as the room).
 	tok, err := r.signer.Issue(token.Payload{
@@ -409,6 +411,7 @@ func (r *Registry) RejoinRoom(s *Session, m protocol.RejoinRoomMsg) Result {
 		r.mu.Unlock()
 		recreated = true
 		r.metrics.RejoinsRecreated.Inc()
+		r.markDirty(p.RoomID)
 	}
 
 	room.mu.Lock()
@@ -500,6 +503,7 @@ func (r *Registry) RejoinRoom(s *Session, m protocol.RejoinRoomMsg) Result {
 	if !recreated {
 		r.metrics.RejoinsSame.Inc()
 	}
+	r.markDirty(room.roomID)
 
 	resp := protocol.RejoinRoomResponse{
 		Type:                 protocol.TypeRejoinRoomResponse,
@@ -578,6 +582,7 @@ func (r *Registry) Signal(s *Session, m protocol.SignalMsg) Result {
 		otherSlot.bufferBytes = 0
 		otherSlot.overflowReset = true
 		r.metrics.SignalBufferOverflow.Inc()
+		r.markDirty(room.roomID)
 		return errResult(protocol.ErrSignalBufferOverflow, "signal buffer overflow", m.RequestID, nil)
 	}
 
@@ -589,6 +594,7 @@ func (r *Registry) Signal(s *Session, m protocol.SignalMsg) Result {
 		ReceivedAt: now,
 	})
 	otherSlot.bufferBytes += len(m.Data)
+	r.markDirty(room.roomID)
 	return Result{}
 }
 
@@ -617,6 +623,7 @@ func (r *Registry) PeerConnected(s *Session, m protocol.PeerConnectedMsg) Result
 		releaseAt := r.now().Add(r.cfg.PeerConnectedGrace())
 		room.releaseAt = &releaseAt
 	}
+	r.markDirty(room.roomID)
 	return Result{}
 }
 
@@ -632,6 +639,7 @@ func (r *Registry) CloseRoom(s *Session, m protocol.CloseRoomMsg) Result {
 	room.mu.Lock()
 	r.closeRoomLocked(room, tombstone.ReasonClosedByPeer, "closed by peer")
 	room.mu.Unlock()
+	r.markDeleted(room.roomID)
 	return Result{}
 }
 
@@ -705,6 +713,7 @@ func (r *Registry) Detach(s *Session) {
 		now := r.now()
 		deadline := r.computePeerDeadline(now, room.expiresAt)
 		room.peerDeadlineAt = &deadline
+		r.markDirty(room.roomID)
 	} else {
 		// Both slots empty; the room is abandoned. Leave it in the map for the
 		// peer deadline / expiry sweep to reap, OR remove now if no buffer
@@ -715,10 +724,12 @@ func (r *Registry) Detach(s *Session) {
 		// rejoin to — drop it.
 		if room.slots[protocol.RoleHost].epoch == "" && room.slots[protocol.RoleGuest].epoch == "" {
 			r.removeRoomLocked(room)
+			r.markDeleted(room.roomID)
 		} else {
 			now := r.now()
 			deadline := r.computePeerDeadline(now, room.expiresAt)
 			room.peerDeadlineAt = &deadline
+			r.markDirty(room.roomID)
 		}
 	}
 }

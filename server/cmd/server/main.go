@@ -26,6 +26,7 @@ import (
 	"github.com/kku1993/simple-webrtc-server/internal/requestlog"
 	"github.com/kku1993/simple-webrtc-server/internal/room"
 	"github.com/kku1993/simple-webrtc-server/internal/server"
+	"github.com/kku1993/simple-webrtc-server/internal/state"
 	"github.com/kku1993/simple-webrtc-server/internal/token"
 	"github.com/kku1993/simple-webrtc-server/internal/tombstone"
 	"github.com/kku1993/simple-webrtc-server/internal/turn"
@@ -93,6 +94,9 @@ func registerFlags() (buildOverrides func() config.FlagOverrides, showVersion *b
 	fMaxRoomsGlobal := flag.Int("max-rooms-global", 0, envVar("MAX_ROOMS_GLOBAL", "global cap on concurrent rooms"))
 	fMaxConnectionsGlobal := flag.Int("max-connections-global", 0, envVar("MAX_CONNECTIONS_GLOBAL", "global cap on concurrent WebSocket connections"))
 	fMaxRoomsPerIp := flag.Int("max-rooms-per-ip", 0, envVar("MAX_ROOMS_PER_IP", "concurrent rooms per client IP"))
+	fStateDir := flag.String("state-dir", "", envVar("STATE_DIR", "directory for room state persistence; empty disables"))
+	fStateFlushIntervalMs := flag.Int("state-flush-interval-ms", 0, envVar("STATE_FLUSH_INTERVAL_MS", "persister flush interval in milliseconds"))
+	fStateBatchSize := flag.Int("state-batch-size", 0, envVar("STATE_BATCH_SIZE", "max rooms per flush batch"))
 
 	// flag.Visit only iterates flags that were explicitly set, so the closure
 	// emits pointers solely for those — preserving env-var/default fallback for
@@ -180,6 +184,15 @@ func registerFlags() (buildOverrides func() config.FlagOverrides, showVersion *b
 		if _, ok := set["max-rooms-per-ip"]; ok {
 			o.MaxRoomsPerIp = fMaxRoomsPerIp
 		}
+		if _, ok := set["state-dir"]; ok {
+			o.StateDir = fStateDir
+		}
+		if _, ok := set["state-flush-interval-ms"]; ok {
+			o.StateFlushIntervalMs = fStateFlushIntervalMs
+		}
+		if _, ok := set["state-batch-size"]; ok {
+			o.StateBatchSize = fStateBatchSize
+		}
 		return o
 	}
 	return buildOverrides, showVersion
@@ -211,7 +224,30 @@ func run(overrides config.FlagOverrides) error {
 		log.Printf("TURN enabled; minting %s credentials via Cloudflare Calls", cfg.TurnCredentialTtl())
 	}
 
-	reg := room.New(cfg, signer, tomb, m, turnClient)
+	// Construct the registry first (without a persister) so the snapshot
+	// function can close over it. When STATE_DIR is set, restore rooms from
+	// disk before starting the persister — this avoids racing rehydration
+	// with writes, and avoids overwriting on-disk state with empty memory.
+	reg := room.New(cfg, signer, tomb, m, turnClient, nil)
+
+	if cfg.StateEnabled() {
+		store, err := state.NewFileStore(cfg.StateDir)
+		if err != nil {
+			return fmt.Errorf("state store: %w", err)
+		}
+		if n, err := reg.Restore(store); err != nil {
+			return fmt.Errorf("restore room state: %w", err)
+		} else if n > 0 {
+			log.Printf("restored %d room(s) from %s", n, cfg.StateDir)
+		}
+		persister := state.NewPersister(store, reg.SnapshotRoom, cfg.StateFlushInterval(), cfg.StateBatchSize)
+		persister.Start()
+		reg.SetPersister(persister)
+		// Re-snapshot all restored rooms so their reset peer deadlines are
+		// persisted; subsequent state changes are queued as normal.
+		reg.MarkAllDirty()
+	}
+
 	reg.StartSweep()
 	defer reg.Stop()
 

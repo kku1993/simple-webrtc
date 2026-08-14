@@ -24,6 +24,7 @@ import (
 	"github.com/kku1993/simple-webrtc-server/internal/protocol"
 	"github.com/kku1993/simple-webrtc-server/internal/ratelimit"
 	"github.com/kku1993/simple-webrtc-server/internal/roomid"
+	"github.com/kku1993/simple-webrtc-server/internal/state"
 	"github.com/kku1993/simple-webrtc-server/internal/tombstone"
 	"github.com/kku1993/simple-webrtc-server/internal/token"
 	"github.com/kku1993/simple-webrtc-server/internal/turn"
@@ -135,6 +136,10 @@ type Registry struct {
 	createLimiter *ratelimit.Map
 	handshakeLimiter *ratelimit.Map
 
+	// persister queues batched disk writes of room state. nil when
+	// persistence is disabled (STATE_DIR empty).
+	persister *state.Persister
+
 	mu    sync.Mutex
 	rooms map[string]*Room
 
@@ -148,14 +153,17 @@ type Registry struct {
 // New constructs a Registry. The signer, tombstone store, and metrics must be
 // non-nil; the rate limiters are constructed from the config. turn may be nil
 // to disable server-provided TURN credentials (handshake responses then omit
-// the iceServers field).
-func New(cfg config.Config, signer *token.Signer, tomb *tombstone.Store, m *metrics.Metrics, turn *turn.Client) *Registry {
+// the iceServers field). persister may be nil to disable disk persistence;
+// when non-nil it must already be started (Start called) and will be flushed
+// and closed by Stop.
+func New(cfg config.Config, signer *token.Signer, tomb *tombstone.Store, m *metrics.Metrics, turn *turn.Client, persister *state.Persister) *Registry {
 	r := &Registry{
 		cfg:    cfg,
 		signer: signer,
 		tomb:   tomb,
 		metrics: m,
 		turn:   turn,
+		persister: persister,
 		rooms:  make(map[string]*Room),
 		nowFunc: time.Now,
 		stopCh: make(chan struct{}),
@@ -167,6 +175,69 @@ func New(cfg config.Config, signer *token.Signer, tomb *tombstone.Store, m *metr
 	// WebSocket handshakes: 10/min, burst 20.
 	r.handshakeLimiter = ratelimit.NewMap(100000, 10.0/60.0, 20)
 	return r
+}
+
+// SetPersister installs a persister after construction, primarily for tests
+// that build the registry via New with a nil persister and later inject one.
+func (r *Registry) SetPersister(p *state.Persister) { r.persister = p }
+
+// markDirty enqueues a batched save for roomID. No-op when persistence is
+// disabled (persister is nil).
+func (r *Registry) markDirty(roomID string) {
+	if r.persister != nil {
+		r.persister.MarkDirty(roomID)
+	}
+}
+
+// markDeleted enqueues a batched delete for roomID. No-op when persistence is
+// disabled.
+func (r *Registry) markDeleted(roomID string) {
+	if r.persister != nil {
+		r.persister.MarkDeleted(roomID)
+	}
+}
+
+// snapshotRoom is the SnapshotFunc passed to the persister. It returns the
+// current JSON-encoded state of the room, or (nil, false) if the room no longer
+// exists (which the persister treats as a delete).
+func (r *Registry) snapshotRoom(roomID string) ([]byte, bool) {
+	r.mu.Lock()
+	room, ok := r.rooms[roomID]
+	r.mu.Unlock()
+	if !ok {
+		return nil, false
+	}
+	room.mu.Lock()
+	defer room.mu.Unlock()
+	data := r.marshalSnapshot(room)
+	if data == nil {
+		return nil, false
+	}
+	return data, true
+}
+
+// SnapshotRoom is the exported SnapshotFunc for the persister. It is the same
+// as the unexported snapshotRoom, exported so cmd/server can pass it as a
+// callback before the persister is wired into the registry.
+func (r *Registry) SnapshotRoom(roomID string) ([]byte, bool) {
+	return r.snapshotRoom(roomID)
+}
+
+// MarkAllDirty enqueues a save for every live room. Used after Restore to
+// persist reset peer deadlines. No-op when persistence is disabled.
+func (r *Registry) MarkAllDirty() {
+	if r.persister == nil {
+		return
+	}
+	r.mu.Lock()
+	ids := make([]string, 0, len(r.rooms))
+	for id := range r.rooms {
+		ids = append(ids, id)
+	}
+	r.mu.Unlock()
+	for _, id := range ids {
+		r.markDirty(id)
+	}
 }
 
 // SetClock installs a custom clock, primarily for tests.

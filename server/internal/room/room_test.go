@@ -120,7 +120,7 @@ func testRegistryWith(t testing.TB, mutate func(*config.Config)) (*Registry, *to
 	}
 	m := metrics.New()
 	tomb := tombstone.New(cfg.TombstoneMaxEntries, cfg.TombstoneTtl())
-	r := New(cfg, signer, tomb, m, nil)
+	r := New(cfg, signer, tomb, m, nil, nil)
 	return r, signer
 }
 
@@ -1019,7 +1019,7 @@ func registryWithTurn(t *testing.T) (*Registry, *int, *string) {
 	}
 	m := metrics.New()
 	tomb := tombstone.New(cfg.TombstoneMaxEntries, cfg.TombstoneTtl())
-	r := New(cfg, signer, tomb, m, tc)
+	r := New(cfg, signer, tomb, m, tc, nil)
 	return r, calls, lastBody
 }
 
@@ -1281,7 +1281,7 @@ func TestCreateRoomRollsBackOnTurnFailure(t *testing.T) {
 	signer, _ := token.NewSigner(cfg.ServerSecret)
 	m := metrics.New()
 	tomb := tombstone.New(cfg.TombstoneMaxEntries, cfg.TombstoneTtl())
-	r := New(cfg, signer, tomb, m, tc)
+	r := New(cfg, signer, tomb, m, tc, nil)
 
 	host := NewSession(newFakeConn("1.1.1.1"))
 	res := r.CreateRoom(host, protocol.CreateRoomMsg{Type: protocol.TypeCreateRoom, HostEpoch: "h"}, true)

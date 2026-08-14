@@ -13,7 +13,10 @@ client in `docs/DESIGN.md`.
 - `src/internal/tombstone/` — bounded TTL LRU of deliberately-closed room IDs.
 - `src/internal/ratelimit/` — token buckets + per-IP counter map (both bounded LRU).
 - `src/internal/room/` — room registry, slot state machine, signal buffering,
-  epochs, lifecycle timers, recreate-from-token.
+  epochs, lifecycle timers, recreate-from-token, disk snapshot/restore
+  (`snapshot.go`: versioned JSON projection of Room minus live Conn fields;
+  `Restore` rehydrates rooms on startup, clearing `releaseAt` and setting a
+  fresh peer deadline).
 - `src/internal/roomid/` — room ID generator + validator following
   `docs/ROOM_ID_SPEC.md` (`[shard][nid]`, e.g. `ta0000`; Crockford base32
   fuzzy decoding on input).
@@ -27,6 +30,12 @@ client in `docs/DESIGN.md`.
   `/healthz`, `/metrics`, and the WebSocket transport: framing over gobwas/ws
   (`wsconn.go`), epoll-driven reads (`poller_linux.go`) with a
   goroutine-per-connection fallback (`poller_other.go`, `readloop.go`).
+- `src/internal/state/` — disk persistence of room state. `FileStore` writes
+  one JSON file per room (atomic temp+rename); `Persister` is a batching,
+  coalescing write queue that drains a channel of dirty/deleted room IDs and
+  flushes on a timer or when the batch reaches a configured size, so
+  high-frequency state changes (e.g. signal buffering) collapse into a single
+  file write per flush interval. Enabled by `STATE_DIR`; disabled by default.
 
 - `loadtest/` — containerized load test harness (generator + runner). See
   `loadtest/README.md`; results live in `docs/LOAD_TEST_RESULTS.md`.
@@ -57,6 +66,18 @@ Crockford base32 character (`a-z` excluding `i`, `l`, `o`, `u`) baked into
 every generated room id. Use `*` for `ALLOWED_ORIGINS` to disable origin
 checking (logs a warning). See `docs/DESIGN.md` §"Configuration reference" for
 the full list.
+
+### Disk persistence (optional)
+
+Set `STATE_DIR` to a directory to enable room state persistence. The server
+writes one JSON file per room (atomic temp+rename) and rehydrates live rooms
+on restart, so clients can rejoin after a server crash or rolling restart.
+Writes are queued and batched by the `Persister` (see `internal/state`):
+state changes mark a room "dirty" on a buffered channel, and a single flush
+goroutine coalesces dirty/deleted room IDs and writes them on a timer
+(`STATE_FLUSH_INTERVAL_MS`, default 100ms) or when the batch reaches
+`STATE_BATCH_SIZE` (default 256). This bounds disk write frequency regardless
+of how many times a room is dirtied. Disabled by default (empty `STATE_DIR`).
 
 ## Client (`client/`)
 
