@@ -13,7 +13,7 @@ reference. This README covers getting both sides running end-to-end.
 
 Both the server binary and the client library are distributed as artifacts
 attached to [GitHub releases](https://github.com/kku1993/simple-webrtc/releases),
-tagged after the repo-root `VERSION` file (e.g. `v0.1.0`).
+tagged after the repo-root `VERSION` file (e.g. `v0.8.0`).
 
 ### 1. Run the signaling server
 
@@ -21,7 +21,7 @@ Download the prebuilt binary for your architecture from the latest release
 (`x86_64` for linux/amd64, `arm64` for linux/arm64):
 
 ```sh
-VERSION=0.1.0
+VERSION=0.8.0
 ARCH=x86_64   # or arm64
 curl -L -o simple-webrtc-server \
   https://github.com/kku1993/simple-webrtc/releases/download/v${VERSION}/simple-webrtc-server-${VERSION}-${ARCH}
@@ -63,7 +63,7 @@ The client ships as the `@simple-webrtc/client` npm package, distributed
 as a tarball attached to the same GitHub release. Install it in your project:
 
 ```sh
-npm install https://github.com/kku1993/simple-webrtc/releases/download/v0.1.0/simple-webrtc-client-0.1.0.tgz
+npm install https://github.com/kku1993/simple-webrtc/releases/download/v0.8.0/simple-webrtc-client-0.8.0.tgz
 ```
 
 One `PeerConnection` represents one room pairing. The host creates a room,
@@ -269,16 +269,61 @@ The server builds the `iceServers` array for every handshake response
 **Google's public STUN server is always included**, and when TURN is configured,
 short-lived Cloudflare TURN credentials are appended. The client applies them to
 each peer generation, including peers rebuilt after a reconnect, so a `rejoin`
-rotates credentials without an app deploy. Anything the application passes in
-`rtc.config.iceServers` wins over the server-provided set:
+rotates credentials without an app deploy.
+
+#### How the backend assigns `iceServers`
+
+The backend is the default source of ICE configuration. On every handshake the
+server returns an `iceServers` array in the response body; the client captures
+it and feeds it to the `RTCPeerConnection` it builds for that connection (and
+to every rebuilt peer after a `peer-reset` or `rejoin`). No client-side
+configuration is required for the server-provided set to take effect — this is
+the path to use when you want the backend to own STUN/TURN selection and
+credential rotation:
+
+```ts
+// The server supplies iceServers; nothing to configure on the client.
+const peer = new PeerConnection({
+  url: "wss://signal.example/v1/signal",
+});
+```
+
+A server that omits the `iceServers` field on a later response (e.g. a
+`rejoin-room-response`) does not strip the previously captured set, so a
+connection that already has TURN keeps it for the rest of its life.
+
+#### Frontend config overrides the backend
+
+An application that wants to control its own STUN/TURN set can override the
+server-provided `iceServers` by passing `rtc.config.iceServers` to
+`PeerConnection`. **Locally supplied values win outright**: when
+`rtc.config.iceServers` is set, the server-provided array is not merged in —
+the application's array replaces it entirely. Other fields on `rtc.config`
+(`iceTransportPolicy`, `bundlePolicy`, etc.) are still applied alongside
+either ICE source.
 
 ```ts
 const peer = new PeerConnection({
   manifest: { url: "https://config.example.com/signal-manifest.json" },
-  // Overrides the server-provided iceServers.
+  // Overrides the server-provided iceServers — the backend's array is NOT
+  // merged in; this list is used verbatim for every peer generation.
   rtc: { config: { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] } },
 });
 ```
+
+The precedence, from the client's perspective:
+
+1. **`rtc.config.iceServers` set by the app** → used verbatim; the server's
+   `iceServers` is ignored.
+2. **`rtc.config.iceServers` unset, server returns `iceServers`** → the
+   server's array is applied (merged with any other `rtc.config` fields).
+3. **Neither side supplies ICE config** → the peer is built with no `config`
+   override, so the browser's defaults apply.
+
+This means an operator can deploy the backend with TURN enabled and have every
+client pick it up automatically, while still leaving the door open for an
+application that needs to host its own STUN/TURN infrastructure to take over
+with a single `rtc.config.iceServers` override — no server change required.
 
 When the server is not configured to mint TURN credentials (the default), the
 `iceServers` field still carries Google's STUN server, so clients always have a
