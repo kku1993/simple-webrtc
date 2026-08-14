@@ -114,6 +114,14 @@ type Room struct {
 	passwordAttempts    int
 	ownerIP             string
 	slots               map[protocol.Role]*Slot
+
+	// turnCache holds the iceServers array minted for this room, reused across
+	// handshakes (create/join/rejoin) so a single room only hits the TURN API
+	// once per credential lifetime. Protected by mu. turnCacheExpiresAt is the
+	// earlier of the credential's TTL and the room's expiry; the cache is
+	// considered stale once now passes it.
+	turnCache          []protocol.IceServer
+	turnCacheExpiresAt time.Time
 }
 
 // Registry holds all live rooms and the supporting stores.
@@ -241,6 +249,47 @@ func (r *Registry) generateIceServers(roomID string) ([]protocol.IceServer, erro
 		})
 	}
 	return out, nil
+}
+
+// iceServersForRoom returns the room's cached iceServers when they are still
+// valid, otherwise mints a fresh set and caches it on the room. The cache is
+// valid until the earlier of the minted credential's TTL and the room's
+// expiry, matching the lifetime of the credential a client could actually use.
+//
+// The caller must hold room.mu.
+func (r *Registry) iceServersForRoom(room *Room) ([]protocol.IceServer, error) {
+	now := r.now()
+	if room.turnCache != nil && now.Before(room.turnCacheExpiresAt) {
+		return room.turnCache, nil
+	}
+	iceServers, err := r.generateIceServers(room.roomID)
+	if err != nil {
+		return nil, err
+	}
+	room.turnCache = iceServers
+	room.turnCacheExpiresAt = r.turnCacheExpiry(now, room.expiresAt)
+	return iceServers, nil
+}
+
+// turnCacheExpiry returns the instant a cached credential becomes stale: the
+// earlier of now+ttl (the credential's lifetime) and the room's expiry (after
+// which the room is gone and the credential is useless).
+func (r *Registry) turnCacheExpiry(now, roomExpiresAt time.Time) time.Time {
+	ttlExpiry := now.Add(r.turnTTL())
+	if roomExpiresAt.Before(ttlExpiry) {
+		return roomExpiresAt
+	}
+	return ttlExpiry
+}
+
+// turnTTL returns the lifetime of a minted TURN credential. When TURN is not
+// configured the value is irrelevant (the cached array is the static STUN
+// list), so DefaultTTL is returned as a harmless placeholder.
+func (r *Registry) turnTTL() time.Duration {
+	if r.turn == nil {
+		return turn.DefaultTTL
+	}
+	return r.turn.TTL()
 }
 
 // generateRoomID produces a collision-checked room id of the form

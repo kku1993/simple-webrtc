@@ -1040,9 +1040,10 @@ func TestHandshakeResponsesCarryIceServers(t *testing.T) {
 	if err := json.Unmarshal(body, &cr); err != nil {
 		t.Fatalf("unmarshal create: %v", err)
 	}
-	// Google STUN (1) + Cloudflare STUN + TURN (2) = 3.
-	if len(cr.IceServers) != 3 {
-		t.Fatalf("create: got %d ice servers, want 3", len(cr.IceServers))
+	// Google STUN (1) + Cloudflare STUN (1) + fake TURN response (STUN + TURN
+	// = 2) = 4.
+	if len(cr.IceServers) != 4 {
+		t.Fatalf("create: got %d ice servers, want 4", len(cr.IceServers))
 	}
 	// Google STUN is first, has no username/credential.
 	if len(cr.IceServers[0].URLs) != 1 || cr.IceServers[0].URLs[0] != "stun:stun.l.google.com:19302" {
@@ -1051,9 +1052,9 @@ func TestHandshakeResponsesCarryIceServers(t *testing.T) {
 	if cr.IceServers[0].Username != "" {
 		t.Errorf("create[0] should have no username, got %q", cr.IceServers[0].Username)
 	}
-	// The TURN entry (third) carries the minted credential.
-	if cr.IceServers[2].Username != "u" || cr.IceServers[2].Credential != "c" {
-		t.Errorf("create TURN entry = %+v, want username=u credential=c", cr.IceServers[2])
+	// The TURN entry (last) carries the minted credential.
+	if cr.IceServers[3].Username != "u" || cr.IceServers[3].Credential != "c" {
+		t.Errorf("create TURN entry = %+v, want username=u credential=c", cr.IceServers[3])
 	}
 
 	// The customIdentifier is `roomId-unixTimestamp`.
@@ -1071,7 +1072,8 @@ func TestHandshakeResponsesCarryIceServers(t *testing.T) {
 		t.Errorf("customIdentifier suffix %q is not a unix timestamp: %v", suffix, err)
 	}
 
-	// The guest join also mints a fresh credential set for the same room.
+	// The guest join reuses the room's cached TURN credentials — no second
+	// mint. The iceServers array is identical to the one the host received.
 	jres := r.JoinRoom(guest, protocol.JoinRoomMsg{Type: protocol.TypeJoinRoom, RoomID: cr.RoomID, GuestEpoch: "g"})
 	if jres.Response == nil {
 		t.Fatalf("expected join-room-response")
@@ -1081,14 +1083,148 @@ func TestHandshakeResponsesCarryIceServers(t *testing.T) {
 	if err := json.Unmarshal(jbody, &jr); err != nil {
 		t.Fatalf("unmarshal join: %v", err)
 	}
-	if len(jr.IceServers) != 3 {
-		t.Fatalf("join: got %d ice servers, want 3", len(jr.IceServers))
+	if len(jr.IceServers) != 4 {
+		t.Fatalf("join: got %d ice servers, want 4", len(jr.IceServers))
 	}
 	if jr.IceServers[0].URLs[0] != "stun:stun.l.google.com:19302" {
 		t.Errorf("join[0] = %+v, want Google STUN", jr.IceServers[0])
 	}
+	// Same cached TURN credential as the host.
+	if jr.IceServers[3].Username != cr.IceServers[3].Username ||
+		jr.IceServers[3].Credential != cr.IceServers[3].Credential {
+		t.Errorf("join TURN credential = %+v, want the cached host credential %+v",
+			jr.IceServers[3], cr.IceServers[3])
+	}
+	if *calls != 1 {
+		t.Errorf("TURN API called %d times, want 1 (cached after create)", *calls)
+	}
+}
+
+// A rejoin on an existing room reuses the cached TURN credentials — the TURN
+// API is not called again.
+func TestTurnCacheReusedByRejoin(t *testing.T) {
+	r, calls, _ := registryWithTurn(t)
+	host := NewSession(newFakeConn("1.1.1.1"))
+	guest := NewSession(newFakeConn("2.2.2.2"))
+
+	res := r.CreateRoom(host, protocol.CreateRoomMsg{Type: protocol.TypeCreateRoom, HostEpoch: "h"}, true)
+	body, _ := json.Marshal(res.Response)
+	var cr protocol.CreateRoomResponse
+	_ = json.Unmarshal(body, &cr)
+	roomID := cr.RoomID
+
+	r.JoinRoom(guest, protocol.JoinRoomMsg{Type: protocol.TypeJoinRoom, RoomID: roomID, GuestEpoch: "g"})
+	if *calls != 1 {
+		t.Fatalf("after create+join, TURN API called %d times, want 1", *calls)
+	}
+
+	// A host rejoin on the existing room should reuse the cache.
+	host2 := NewSession(newFakeConn("1.1.1.1"))
+	rres := r.RejoinRoom(host2, protocol.RejoinRoomMsg{
+		Type:        protocol.TypeRejoinRoom,
+		RejoinToken: cr.RejoinToken,
+		Epoch:       "h",
+	})
+	if rres.Response == nil {
+		t.Fatalf("expected rejoin-room-response")
+	}
+	rbody, _ := json.Marshal(rres.Response)
+	var rr protocol.RejoinRoomResponse
+	if err := json.Unmarshal(rbody, &rr); err != nil {
+		t.Fatalf("unmarshal rejoin: %v", err)
+	}
+	if rr.Recreated {
+		t.Errorf("rejoin should not recreate an existing room")
+	}
+	if *calls != 1 {
+		t.Errorf("after rejoin, TURN API called %d times, want 1 (cache reused)", *calls)
+	}
+	// Same cached credential.
+	if rr.IceServers[3].Username != cr.IceServers[3].Username ||
+		rr.IceServers[3].Credential != cr.IceServers[3].Credential {
+		t.Errorf("rejoin TURN credential = %+v, want cached %+v",
+			rr.IceServers[3], cr.IceServers[3])
+	}
+}
+
+// When the TURN credential's TTL has elapsed (but the room is still alive),
+// the next handshake mints a fresh credential set.
+func TestTurnCacheRefreshedAfterTTLExpiry(t *testing.T) {
+	r, calls, _ := registryWithTurn(t)
+	// The fake TURN client uses a 1h TTL (see registryWithTurn).
+	now := time.Now()
+	r.SetClock(func() time.Time { return now })
+
+	host := NewSession(newFakeConn("1.1.1.1"))
+	guest := NewSession(newFakeConn("2.2.2.2"))
+
+	res := r.CreateRoom(host, protocol.CreateRoomMsg{Type: protocol.TypeCreateRoom, HostEpoch: "h"}, true)
+	body, _ := json.Marshal(res.Response)
+	var cr protocol.CreateRoomResponse
+	_ = json.Unmarshal(body, &cr)
+	roomID := cr.RoomID
+
+	r.JoinRoom(guest, protocol.JoinRoomMsg{Type: protocol.TypeJoinRoom, RoomID: roomID, GuestEpoch: "g"})
+	if *calls != 1 {
+		t.Fatalf("after create+join, TURN API called %d times, want 1", *calls)
+	}
+
+	// Advance past the 1h TURN TTL. The room's max lifetime is 90min, so the
+	// room is still alive at 61min.
+	r.SetClock(func() time.Time { return now.Add(61 * time.Minute) })
+
+	host2 := NewSession(newFakeConn("1.1.1.1"))
+	rres := r.RejoinRoom(host2, protocol.RejoinRoomMsg{
+		Type:        protocol.TypeRejoinRoom,
+		RejoinToken: cr.RejoinToken,
+		Epoch:       "h",
+	})
+	if rres.Response == nil {
+		t.Fatalf("expected rejoin-room-response")
+	}
 	if *calls != 2 {
-		t.Errorf("TURN API called %d times, want 2 (one per handshake)", *calls)
+		t.Errorf("after TTL expiry + rejoin, TURN API called %d times, want 2 (fresh mint)", *calls)
+	}
+}
+
+// A rejoin that recreates a lost room mints fresh credentials (the room's cache
+// was lost along with the room).
+func TestTurnCacheRecreatedRoomMintsFresh(t *testing.T) {
+	r, calls, _ := registryWithTurn(t)
+	host := NewSession(newFakeConn("1.1.1.1"))
+	res := r.CreateRoom(host, protocol.CreateRoomMsg{Type: protocol.TypeCreateRoom, HostEpoch: "h1"}, true)
+	body, _ := json.Marshal(res.Response)
+	var cr protocol.CreateRoomResponse
+	_ = json.Unmarshal(body, &cr)
+	roomID := cr.RoomID
+	hostTok := cr.RejoinToken
+	if *calls != 1 {
+		t.Fatalf("after create, TURN API called %d times, want 1", *calls)
+	}
+
+	// Simulate the server losing all state.
+	r.mu.Lock()
+	delete(r.rooms, roomID)
+	r.roomsGlobal.Add(-1)
+	r.roomsPerIP.Decrement("1.1.1.1")
+	r.mu.Unlock()
+
+	host2 := NewSession(newFakeConn("1.1.1.1"))
+	rres := r.RejoinRoom(host2, protocol.RejoinRoomMsg{
+		Type:        protocol.TypeRejoinRoom,
+		RejoinToken: hostTok,
+		Epoch:       "h2",
+	})
+	rbody, _ := json.Marshal(rres.Response)
+	var rr protocol.RejoinRoomResponse
+	if err := json.Unmarshal(rbody, &rr); err != nil {
+		t.Fatalf("unmarshal rejoin: %v", err)
+	}
+	if !rr.Recreated {
+		t.Errorf("expected recreated=true")
+	}
+	if *calls != 2 {
+		t.Errorf("after recreate, TURN API called %d times, want 2 (fresh mint for new room)", *calls)
 	}
 }
 
@@ -1103,8 +1239,8 @@ func TestHandshakeResponsesIncludeGoogleStunWhenTurnDisabled(t *testing.T) {
 	if err := json.Unmarshal(body, &cr); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if len(cr.IceServers) != 1 {
-		t.Fatalf("got %d ice servers, want 1 (Google STUN only)", len(cr.IceServers))
+	if len(cr.IceServers) != 2 {
+		t.Fatalf("got %d ice servers, want 2 (Google STUN + Cloudflare STUN only)", len(cr.IceServers))
 	}
 	if len(cr.IceServers[0].URLs) != 1 || cr.IceServers[0].URLs[0] != "stun:stun.l.google.com:19302" {
 		t.Errorf("iceServers[0] = %+v, want Google STUN", cr.IceServers[0])

@@ -91,6 +91,10 @@ func (c *Client) SetEndpoint(u string) { c.endpoint = u }
 // SetHTTPClient overrides the underlying http.Client, primarily for tests.
 func (c *Client) SetHTTPClient(h *http.Client) { c.httpClient = h }
 
+// TTL returns the lifetime of each minted credential. Callers use it to size a
+// cache that holds a minted iceServers array until the credential would expire.
+func (c *Client) TTL() time.Duration { return c.ttl }
+
 // Generate mints a fresh iceServers array. customIdentifier is optional; when
 // non-empty it tags the credential in Cloudflare's analytics so usage can be
 // aggregated per session. The caller should include a room id and a timestamp

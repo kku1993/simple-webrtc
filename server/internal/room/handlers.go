@@ -121,17 +121,22 @@ func (r *Registry) CreateRoom(s *Session, m protocol.CreateRoomMsg, turnstileOK 
 	}
 
 	now := r.now()
+	expiresAt := r.computeExpiresAt(now, now)
 	room := &Room{
 		reg:             r,
 		roomID:          roomID,
 		createdAt:       now,
 		instantiatedAt:  now,
-		expiresAt:       r.computeExpiresAt(now, now),
+		expiresAt:       expiresAt,
 		ownerIP:         ip,
 		slots: map[protocol.Role]*Slot{
 			protocol.RoleHost:  {},
 			protocol.RoleGuest: {},
 		},
+		// Seed the per-room TURN cache with the credentials minted above so the
+		// guest's join-room handshake reuses them instead of minting again.
+		turnCache:          iceServers,
+		turnCacheExpiresAt: r.turnCacheExpiry(now, expiresAt),
 	}
 	deadline := r.computePeerDeadline(now, room.expiresAt)
 	room.peerDeadlineAt = &deadline
@@ -248,9 +253,11 @@ func (r *Registry) JoinRoom(s *Session, m protocol.JoinRoomMsg) Result {
 		return errResult(protocol.ErrRoomFull, "room is full", m.RequestID, nil)
 	}
 
-	// Mint short-lived TURN credentials before attaching, so a failure leaves
-	// the slot untouched. Omitted (nil) when TURN is not configured.
-	iceServers, err := r.generateIceServers(room.roomID)
+	// Reuse the room's cached TURN credentials when still valid, otherwise
+	// mint a fresh set (caching it for the next handshake). Omitted (nil)
+	// when TURN is not configured. room.mu is held, so the cache check and
+	// the mint are atomic with respect to other handshakes on this room.
+	iceServers, err := r.iceServersForRoom(room)
 	if err != nil {
 		return errResult(protocol.ErrServerAtCapacity, "could not generate TURN credentials", m.RequestID, nil)
 	}
@@ -351,17 +358,19 @@ func (r *Registry) RejoinRoom(s *Session, m protocol.RejoinRoomMsg) Result {
 	room, ok := r.rooms[p.RoomID]
 	r.mu.Unlock()
 
-	// Mint short-lived TURN credentials before any recreate or slot attach, so
-	// a failure requires no rollback (the recreate path has not yet allocated
-	// counters or published a room). Omitted (nil) when TURN is not configured.
-	iceServers, err := r.generateIceServers(p.RoomID)
-	if err != nil {
-		return errResult(protocol.ErrServerAtCapacity, "could not generate TURN credentials", m.RequestID, nil)
-	}
-
 	recreated := false
+	var iceServers []protocol.IceServer
 	if !ok {
 		// 4b. Recreate the room from the token.
+		// Mint short-lived TURN credentials before allocating counters, so
+		// a failure requires no rollback (the recreate path has not yet
+		// allocated counters or published a room). The minted set seeds the
+		// new room's cache so a subsequent rejoin reuses it. Omitted (nil)
+		// when TURN is not configured.
+		iceServers, err = r.generateIceServers(p.RoomID)
+		if err != nil {
+			return errResult(protocol.ErrServerAtCapacity, "could not generate TURN credentials", m.RequestID, nil)
+		}
 		if _, ok := r.roomsPerIP.Increment(ip); !ok {
 			r.metrics.RateLimitRejects.Inc()
 			return errResult(protocol.ErrRateLimited, "per-IP room limit reached", m.RequestID, nil)
@@ -373,17 +382,20 @@ func (r *Registry) RejoinRoom(s *Session, m protocol.RejoinRoomMsg) Result {
 		}
 
 		createdAt := time.Unix(p.CreatedAt, 0)
+		expiresAt := r.computeExpiresAt(now, createdAt)
 		room = &Room{
 			reg:            r,
 			roomID:         p.RoomID,
 			createdAt:      createdAt,
 			instantiatedAt: now,
-			expiresAt:      r.computeExpiresAt(now, createdAt),
+			expiresAt:      expiresAt,
 			ownerIP:        ip,
 			slots: map[protocol.Role]*Slot{
 				protocol.RoleHost:  {},
 				protocol.RoleGuest: {},
 			},
+			turnCache:          iceServers,
+			turnCacheExpiresAt: r.turnCacheExpiry(now, expiresAt),
 		}
 		if p.GuestPasswordHash != "" && p.GuestPasswordSalt != "" {
 			room.guestPasswordHash = mustDecodeB64(p.GuestPasswordHash)
@@ -401,6 +413,17 @@ func (r *Registry) RejoinRoom(s *Session, m protocol.RejoinRoomMsg) Result {
 
 	room.mu.Lock()
 	defer room.mu.Unlock()
+
+	// For an existing room, reuse the cached TURN credentials (minting a fresh
+	// set only if the cache is stale). For a recreated room the cache was
+	// already seeded above. room.mu is held, so the cache check and any mint
+	// are atomic with respect to other handshakes on this room.
+	if !recreated {
+		iceServers, err = r.iceServersForRoom(room)
+		if err != nil {
+			return errResult(protocol.ErrServerAtCapacity, "could not generate TURN credentials", m.RequestID, nil)
+		}
+	}
 
 	mySlot := room.slots[role]
 	otherRole := role.Other()
