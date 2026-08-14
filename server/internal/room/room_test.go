@@ -2,6 +2,8 @@ package room
 
 import (
 	"encoding/json"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"strings"
@@ -14,6 +16,7 @@ import (
 	"github.com/kku1993/simple-webrtc-server/internal/protocol"
 	"github.com/kku1993/simple-webrtc-server/internal/tombstone"
 	"github.com/kku1993/simple-webrtc-server/internal/token"
+	"github.com/kku1993/simple-webrtc-server/internal/turn"
 )
 
 // fakeConn is a recording room.Conn used to drive the registry in tests.
@@ -117,7 +120,7 @@ func testRegistryWith(t testing.TB, mutate func(*config.Config)) (*Registry, *to
 	}
 	m := metrics.New()
 	tomb := tombstone.New(cfg.TombstoneMaxEntries, cfg.TombstoneTtl())
-	r := New(cfg, signer, tomb, m)
+	r := New(cfg, signer, tomb, m, nil)
 	return r, signer
 }
 
@@ -960,5 +963,202 @@ func TestSignalRelaysEscapedPayloadVerbatim(t *testing.T) {
 	r.Signal(host, protocol.SignalMsg{Type: protocol.TypeSignal, Seq: 1, Data: sigData(payload)})
 	if got := fc(guest).last()["data"]; got != payload {
 		t.Errorf("data = %q, want %q", got, payload)
+	}
+}
+
+// fakeTurnServer returns an httptest server that replies to the
+// generate-ice-servers call with a fixed iceServers payload, and a turn.Client
+// pointed at it. The last request body is captured for identifier verification.
+func fakeTurnServer(t *testing.T) (*turn.Client, *int, *string) {
+	t.Helper()
+	calls := 0
+	var lastBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		b, _ := io.ReadAll(r.Body)
+		lastBody = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"iceServers":[{"urls":["stun:stun.cloudflare.com:3478"]},{"urls":["turn:turn.cloudflare.com:3478?transport=udp"],"username":"u","credential":"c"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+	c := turn.New("test-key", "test-token", time.Hour)
+	c.SetEndpoint(srv.URL)
+	return c, &calls, &lastBody
+}
+
+// registryWithTurn builds a registry whose TURN client points at fakeTurnServer.
+func registryWithTurn(t *testing.T) (*Registry, *int, *string) {
+	t.Helper()
+	tc, calls, lastBody := fakeTurnServer(t)
+	cfg := config.Config{
+		ListenAddr:                    ":0",
+		ServerSecret:                  []byte("0123456789abcdef0123456789abcdef0123456789abcdef"),
+		AllowedOrigins:                []string{"*"},
+		ShardName:                     "t",
+		PeerDeadlineSec:               600,
+		RoomMaxLifetimeSec:            5400,
+		RejoinTokenTtlSec:             43200,
+		ReleaseSocketsOnPeerConnected: true,
+		PeerConnectedGraceSec:         60,
+		MaxFrameBytes:                 65536,
+		MaxBufferedSignals:            64,
+		MaxBufferedSignalBytes:        262144,
+		MaxPasswordAttempts:           5,
+		HandshakeTimeoutMs:            10000,
+		PingIntervalSec:               30,
+		TombstoneMaxEntries:           100000,
+		TombstoneTtlSec:               3600,
+		MaxRoomsGlobal:                50000,
+		MaxConnectionsGlobal:          100000,
+		MaxRoomsPerIp:                 20,
+	}
+	signer, err := token.NewSigner(cfg.ServerSecret)
+	if err != nil {
+		t.Fatalf("NewSigner: %v", err)
+	}
+	m := metrics.New()
+	tomb := tombstone.New(cfg.TombstoneMaxEntries, cfg.TombstoneTtl())
+	r := New(cfg, signer, tomb, m, tc)
+	return r, calls, lastBody
+}
+
+// When a TURN client is configured, the create-room and join-room responses
+// carry Google STUN prepended to the minted iceServers, and the credential is
+// tagged with `roomId-unixTimestamp`.
+func TestHandshakeResponsesCarryIceServers(t *testing.T) {
+	r, calls, lastBody := registryWithTurn(t)
+	host := NewSession(newFakeConn("1.1.1.1"))
+	guest := NewSession(newFakeConn("2.2.2.2"))
+
+	res := r.CreateRoom(host, protocol.CreateRoomMsg{Type: protocol.TypeCreateRoom, HostEpoch: "h"}, true)
+	if res.Response == nil {
+		t.Fatalf("expected create-room-response")
+	}
+	body, _ := json.Marshal(res.Response)
+	var cr protocol.CreateRoomResponse
+	if err := json.Unmarshal(body, &cr); err != nil {
+		t.Fatalf("unmarshal create: %v", err)
+	}
+	// Google STUN (1) + Cloudflare STUN + TURN (2) = 3.
+	if len(cr.IceServers) != 3 {
+		t.Fatalf("create: got %d ice servers, want 3", len(cr.IceServers))
+	}
+	// Google STUN is first, has no username/credential.
+	if len(cr.IceServers[0].URLs) != 1 || cr.IceServers[0].URLs[0] != "stun:stun.l.google.com:19302" {
+		t.Errorf("create[0] = %+v, want Google STUN", cr.IceServers[0])
+	}
+	if cr.IceServers[0].Username != "" {
+		t.Errorf("create[0] should have no username, got %q", cr.IceServers[0].Username)
+	}
+	// The TURN entry (third) carries the minted credential.
+	if cr.IceServers[2].Username != "u" || cr.IceServers[2].Credential != "c" {
+		t.Errorf("create TURN entry = %+v, want username=u credential=c", cr.IceServers[2])
+	}
+
+	// The customIdentifier is `roomId-unixTimestamp`.
+	var req struct {
+		CustomIdentifier string `json:"customIdentifier"`
+	}
+	if err := json.Unmarshal([]byte(*lastBody), &req); err != nil {
+		t.Fatalf("decode request body: %v", err)
+	}
+	if !strings.HasPrefix(req.CustomIdentifier, cr.RoomID+"-") {
+		t.Errorf("customIdentifier = %q, want prefix %q-", req.CustomIdentifier, cr.RoomID)
+	}
+	suffix := strings.TrimPrefix(req.CustomIdentifier, cr.RoomID+"-")
+	if _, err := strconv.ParseInt(suffix, 10, 64); err != nil {
+		t.Errorf("customIdentifier suffix %q is not a unix timestamp: %v", suffix, err)
+	}
+
+	// The guest join also mints a fresh credential set for the same room.
+	jres := r.JoinRoom(guest, protocol.JoinRoomMsg{Type: protocol.TypeJoinRoom, RoomID: cr.RoomID, GuestEpoch: "g"})
+	if jres.Response == nil {
+		t.Fatalf("expected join-room-response")
+	}
+	jbody, _ := json.Marshal(jres.Response)
+	var jr protocol.JoinRoomResponse
+	if err := json.Unmarshal(jbody, &jr); err != nil {
+		t.Fatalf("unmarshal join: %v", err)
+	}
+	if len(jr.IceServers) != 3 {
+		t.Fatalf("join: got %d ice servers, want 3", len(jr.IceServers))
+	}
+	if jr.IceServers[0].URLs[0] != "stun:stun.l.google.com:19302" {
+		t.Errorf("join[0] = %+v, want Google STUN", jr.IceServers[0])
+	}
+	if *calls != 2 {
+		t.Errorf("TURN API called %d times, want 2 (one per handshake)", *calls)
+	}
+}
+
+// When no TURN client is configured, the iceServers field still carries
+// Google's STUN server so clients can gather host and srflx candidates.
+func TestHandshakeResponsesIncludeGoogleStunWhenTurnDisabled(t *testing.T) {
+	r, _ := testRegistry(t)
+	host := NewSession(newFakeConn("1.1.1.1"))
+	res := r.CreateRoom(host, protocol.CreateRoomMsg{Type: protocol.TypeCreateRoom, HostEpoch: "h"}, true)
+	body, _ := json.Marshal(res.Response)
+	var cr protocol.CreateRoomResponse
+	if err := json.Unmarshal(body, &cr); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(cr.IceServers) != 1 {
+		t.Fatalf("got %d ice servers, want 1 (Google STUN only)", len(cr.IceServers))
+	}
+	if len(cr.IceServers[0].URLs) != 1 || cr.IceServers[0].URLs[0] != "stun:stun.l.google.com:19302" {
+		t.Errorf("iceServers[0] = %+v, want Google STUN", cr.IceServers[0])
+	}
+}
+
+// A TURN API failure surfaces as a server-at-capacity error and rolls back the
+// room allocation: no room is left behind, and the per-IP/global counters are
+// released.
+func TestCreateRoomRollsBackOnTurnFailure(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+	tc := turn.New("k", "t", time.Hour)
+	tc.SetEndpoint(srv.URL)
+
+	cfg := config.Config{
+		ListenAddr:           ":0",
+		ServerSecret:         []byte("0123456789abcdef0123456789abcdef0123456789abcdef"),
+		AllowedOrigins:       []string{"*"},
+		ShardName:            "t",
+		PeerDeadlineSec:      600,
+		RoomMaxLifetimeSec:   5400,
+		RejoinTokenTtlSec:    43200,
+		MaxFrameBytes:        65536,
+		MaxBufferedSignals:   64,
+		MaxBufferedSignalBytes: 262144,
+		MaxPasswordAttempts:  5,
+		HandshakeTimeoutMs:   10000,
+		PingIntervalSec:      30,
+		TombstoneMaxEntries:  100000,
+		TombstoneTtlSec:      3600,
+		MaxRoomsGlobal:       50000,
+		MaxConnectionsGlobal: 100000,
+		MaxRoomsPerIp:        20,
+	}
+	signer, _ := token.NewSigner(cfg.ServerSecret)
+	m := metrics.New()
+	tomb := tombstone.New(cfg.TombstoneMaxEntries, cfg.TombstoneTtl())
+	r := New(cfg, signer, tomb, m, tc)
+
+	host := NewSession(newFakeConn("1.1.1.1"))
+	res := r.CreateRoom(host, protocol.CreateRoomMsg{Type: protocol.TypeCreateRoom, HostEpoch: "h"}, true)
+	body, _ := json.Marshal(res.Response)
+	var raw map[string]any
+	_ = json.Unmarshal(body, &raw)
+	if raw["type"] != protocol.TypeErrorResponse {
+		t.Fatalf("expected error-response, got %v", raw["type"])
+	}
+	if int(raw["errorCode"].(float64)) != int(protocol.ErrServerAtCapacity) {
+		t.Errorf("errorCode = %v, want %d", raw["errorCode"], protocol.ErrServerAtCapacity)
+	}
+	if r.RoomsGlobal() != 0 {
+		t.Errorf("roomsGlobal = %d after rollback, want 0", r.RoomsGlobal())
 	}
 }

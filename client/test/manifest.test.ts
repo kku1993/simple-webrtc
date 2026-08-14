@@ -6,7 +6,6 @@ import assert from 'node:assert/strict';
 import {
   ManifestError,
   ManifestProvider,
-  applyManifestRtcConfig,
   parseManifest,
   selectShard,
   shardForRoomId,
@@ -36,19 +35,11 @@ test('parseManifest normalizes shard names and defaults the version', () => {
   assert.deepEqual(m.shards, [{ name: 't', url: 'wss://t.example/v1/signal' }]);
 });
 
-test('parseManifest carries ICE settings and opaque app settings', () => {
+test('parseManifest carries opaque app settings', () => {
   const m = parseManifest({
     ...SHARDS,
-    iceServers: [
-      { urls: 'stun:stun.example:3478' },
-      { urls: ['turn:turn.example:3478'], username: 'u', credential: 'p' },
-    ],
-    iceTransportPolicy: 'relay',
     settings: { maxRoomSize: 2 },
   });
-  assert.equal(m.iceServers?.length, 2);
-  assert.equal(m.iceServers?.[1]?.username, 'u');
-  assert.equal(m.iceTransportPolicy, 'relay');
   assert.deepEqual(m.settings, { maxRoomSize: 2 });
 });
 
@@ -64,8 +55,6 @@ test('parseManifest rejects malformed documents with operator-readable errors', 
       { shards: [{ name: 't', url: 'wss://a/' }, { name: 'T', url: 'wss://b/' }] },
       /duplicate shard name/,
     ],
-    [{ ...SHARDS, iceTransportPolicy: 'sometimes' }, /iceTransportPolicy/],
-    [{ ...SHARDS, iceServers: [{}] }, /iceServers\[0\]\.urls/],
     [{ ...SHARDS, version: 99 }, /newer than this client supports/],
   ];
   for (const [input, pattern] of cases) {
@@ -140,24 +129,6 @@ test('singleShardManifest builds a wildcard manifest for one endpoint', () => {
   const m = singleShardManifest('ws://localhost:8080/v1/signal');
   assert.equal(shardForRoomId(m, 'anything').url, 'ws://localhost:8080/v1/signal');
   assert.equal(selectShard(m, () => 0.5).url, 'ws://localhost:8080/v1/signal');
-});
-
-test('applyManifestRtcConfig lets locally supplied config win', () => {
-  const m = parseManifest({
-    ...SHARDS,
-    iceServers: [{ urls: 'stun:manifest.example:3478' }],
-    iceTransportPolicy: 'relay',
-  });
-  assert.deepEqual(applyManifestRtcConfig(m, undefined), {
-    iceServers: [{ urls: 'stun:manifest.example:3478' }],
-    iceTransportPolicy: 'relay',
-  });
-  const local = { iceServers: [{ urls: 'stun:local.example:3478' }] };
-  assert.deepEqual(applyManifestRtcConfig(m, local), {
-    iceServers: [{ urls: 'stun:local.example:3478' }],
-    iceTransportPolicy: 'relay',
-  });
-  assert.equal(applyManifestRtcConfig(null, local), local);
 });
 
 // ---------------------------------------------------------------------------
@@ -378,16 +349,44 @@ test('a remote manifest is fetched before the first handshake', async () => {
   conn.destroy();
 });
 
-test('manifest ICE servers reach every peer generation', async () => {
+test('server-provided iceServers from the join response reach the peer', async () => {
   const h = createFakeHarness();
   const conn = new PeerConnection({
-    manifest: {
-      static: {
-        ...SHARDS,
-        iceServers: [{ urls: 'turn:turn.example:3478', username: 'u', credential: 'p' }],
-        iceTransportPolicy: 'relay',
-      },
-    },
+    manifest: { static: SHARDS },
+    transportFactory: h.transportFactory,
+    peerFactory: h.peerFactory,
+  });
+  const joined = conn.joinRoom({ roomId: 't1a230' });
+  const msg = await waitForSent(h, 'join-room');
+  h.ws.receiveMessage({
+    type: 'join-room-response',
+    roomId: 't1a230',
+    role: 'guest',
+    rejoinToken: 'tok',
+    hostEpoch: 'he',
+    guestEpoch: msg['guestEpoch'],
+    hostConnected: true,
+    roomExpiresAt: ISO_FUTURE,
+    roomExpiresInSeconds: 5400,
+    rejoinTokenExpiresAt: ISO_FUTURE,
+    iceServers: [
+      { urls: ['stun:stun.cloudflare.com:3478'] },
+      { urls: ['turn:turn.cloudflare.com:3478?transport=udp'], username: 'u', credential: 'c' },
+    ],
+  });
+  await joined;
+  const config = h.peers[0]?.opts.config;
+  assert.deepEqual(config?.iceServers, [
+    { urls: ['stun:stun.cloudflare.com:3478'] },
+    { urls: ['turn:turn.cloudflare.com:3478?transport=udp'], username: 'u', credential: 'c' },
+  ]);
+  conn.destroy();
+});
+
+test('a handshake response without iceServers leaves the peer with no override', async () => {
+  const h = createFakeHarness();
+  const conn = new PeerConnection({
+    manifest: { static: SHARDS },
     transportFactory: h.transportFactory,
     peerFactory: h.peerFactory,
   });
@@ -406,11 +405,38 @@ test('manifest ICE servers reach every peer generation', async () => {
     rejoinTokenExpiresAt: ISO_FUTURE,
   });
   await joined;
-  const config = h.peers[0]?.opts.config;
-  assert.deepEqual(config?.iceServers, [
-    { urls: 'turn:turn.example:3478', username: 'u', credential: 'p' },
+  // No iceServers in the response → the peer is built with no config override.
+  assert.equal(h.peers[0]?.opts.config, undefined);
+  conn.destroy();
+});
+
+test('locally supplied rtc.config.iceServers win over the server set', async () => {
+  const h = createFakeHarness();
+  const conn = new PeerConnection({
+    manifest: { static: SHARDS },
+    rtc: { config: { iceServers: [{ urls: 'stun:local.example:3478' }] } },
+    transportFactory: h.transportFactory,
+    peerFactory: h.peerFactory,
+  });
+  const joined = conn.joinRoom({ roomId: 't1a230' });
+  const msg = await waitForSent(h, 'join-room');
+  h.ws.receiveMessage({
+    type: 'join-room-response',
+    roomId: 't1a230',
+    role: 'guest',
+    rejoinToken: 'tok',
+    hostEpoch: 'he',
+    guestEpoch: msg['guestEpoch'],
+    hostConnected: true,
+    roomExpiresAt: ISO_FUTURE,
+    roomExpiresInSeconds: 5400,
+    rejoinTokenExpiresAt: ISO_FUTURE,
+    iceServers: [{ urls: ['turn:turn.cloudflare.com:3478'], username: 'u', credential: 'c' }],
+  });
+  await joined;
+  assert.deepEqual(h.peers[0]?.opts.config?.iceServers, [
+    { urls: 'stun:local.example:3478' },
   ]);
-  assert.equal(config?.iceTransportPolicy, 'relay');
   conn.destroy();
 });
 

@@ -25,6 +25,9 @@ type Config struct {
 	TrustedProxyCount           int
 	CloudflareMode              bool
 	TurnstileSecretKey          string
+	TurnKeyID                   string
+	TurnKeyAPIToken             string
+	TurnCredentialTtlSec        int
 	PeerDeadlineSec             int
 	RoomMaxLifetimeSec          int
 	RejoinTokenTtlSec           int
@@ -65,6 +68,7 @@ func Load() (Config, error) {
 		MaxRoomsGlobal:                50000,
 		MaxConnectionsGlobal:          100000,
 		MaxRoomsPerIp:                 20,
+		TurnCredentialTtlSec:          14400, // 4 hours; matches internal/turn.DefaultTTL
 	}
 
 	get := func(key string, dst *string) {
@@ -111,6 +115,11 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	get("TURNSTILE_SECRET_KEY", &c.TurnstileSecretKey)
+	get("TURN_KEY_ID", &c.TurnKeyID)
+	get("TURN_KEY_API_TOKEN", &c.TurnKeyAPIToken)
+	if err := getInt("TURN_CREDENTIAL_TTL_SEC", &c.TurnCredentialTtlSec); err != nil {
+		return Config{}, err
+	}
 	if err := getInt("PEER_DEADLINE_SEC", &c.PeerDeadlineSec); err != nil {
 		return Config{}, err
 	}
@@ -185,6 +194,14 @@ func (c Config) Validate() error {
 	if !roomid.IsValidShardName(c.ShardName) {
 		return errors.New("SHARD_NAME must be set to a single alphabetic Crockford base32 character (a-z excluding i, l, o, u)")
 	}
+	// TURN credential minting is optional. When enabled, both halves of the
+	// Cloudflare Calls TURN key must be supplied: a key id and its API token.
+	if (c.TurnKeyID == "") != (c.TurnKeyAPIToken == "") {
+		return errors.New("TURN_KEY_ID and TURN_KEY_API_TOKEN must be set together (or both left unset to disable server-provided TURN)")
+	}
+	if c.TurnKeyID != "" && c.TurnCredentialTtlSec <= 0 {
+		return errors.New("TURN_CREDENTIAL_TTL_SEC must be positive when TURN is enabled")
+	}
 	if c.MaxFrameBytes <= 0 {
 		return errors.New("MAX_FRAME_BYTES must be positive")
 	}
@@ -223,6 +240,17 @@ func (c Config) RoomMaxLifetime() time.Duration {
 // RejoinTokenTtl returns the configured rejoin token TTL.
 func (c Config) RejoinTokenTtl() time.Duration {
 	return time.Duration(c.RejoinTokenTtlSec) * time.Second
+}
+
+// TurnEnabled reports whether server-provided TURN credentials are configured.
+// When false, handshake responses omit the iceServers field.
+func (c Config) TurnEnabled() bool {
+	return c.TurnKeyID != "" && c.TurnKeyAPIToken != ""
+}
+
+// TurnCredentialTtl returns the lifetime of minted TURN credentials.
+func (c Config) TurnCredentialTtl() time.Duration {
+	return time.Duration(c.TurnCredentialTtlSec) * time.Second
 }
 
 // PeerConnectedGrace returns the grace period before sockets are released.

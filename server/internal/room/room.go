@@ -8,11 +8,13 @@
 package room
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,6 +26,7 @@ import (
 	"github.com/kku1993/simple-webrtc-server/internal/roomid"
 	"github.com/kku1993/simple-webrtc-server/internal/tombstone"
 	"github.com/kku1993/simple-webrtc-server/internal/token"
+	"github.com/kku1993/simple-webrtc-server/internal/turn"
 )
 
 // Conn is the network abstraction a room uses to talk to a client. The server
@@ -119,6 +122,7 @@ type Registry struct {
 	signer       *token.Signer
 	tomb         *tombstone.Store
 	metrics      *metrics.Metrics
+	turn         *turn.Client
 	roomsPerIP   *ratelimit.CounterMap
 	createLimiter *ratelimit.Map
 	handshakeLimiter *ratelimit.Map
@@ -134,13 +138,16 @@ type Registry struct {
 }
 
 // New constructs a Registry. The signer, tombstone store, and metrics must be
-// non-nil; the rate limiters are constructed from the config.
-func New(cfg config.Config, signer *token.Signer, tomb *tombstone.Store, m *metrics.Metrics) *Registry {
+// non-nil; the rate limiters are constructed from the config. turn may be nil
+// to disable server-provided TURN credentials (handshake responses then omit
+// the iceServers field).
+func New(cfg config.Config, signer *token.Signer, tomb *tombstone.Store, m *metrics.Metrics, turn *turn.Client) *Registry {
 	r := &Registry{
 		cfg:    cfg,
 		signer: signer,
 		tomb:   tomb,
 		metrics: m,
+		turn:   turn,
 		rooms:  make(map[string]*Room),
 		nowFunc: time.Now,
 		stopCh: make(chan struct{}),
@@ -191,6 +198,50 @@ func (r *Registry) ConnectionsGlobal() int64 { return r.connectionsGlobal.Load()
 // --- helpers ---
 
 func (r *Registry) now() time.Time { return r.nowFunc() }
+
+// googleStunIceServer is always included in the iceServers array so clients can
+// gather host and srflx candidates even when TURN is not configured.
+var googleStunIceServer = protocol.IceServer{
+	URLs: []string{"stun:stun.l.google.com:19302"},
+}
+
+var cloudflareStunIceServer = protocol.IceServer{
+	URLs: []string{"stun:stun.cloudflare.com:3478"},
+}
+
+// generateIceServers builds the iceServers array for a handshake response.
+//
+// Google's public STUN server is always included so clients can gather host and
+// srflx candidates even when TURN is not configured. When TURN is configured,
+// short-lived credentials are minted from the Cloudflare Calls TURN API and
+// appended after the Google STUN entry. The credential is tagged with
+// `roomId-unixTimestamp` for per-session usage analytics — the timestamp
+// disambiguates recycled room ids across sessions.
+//
+// The Cloudflare client has its own HTTP timeout, so context.Background is
+// sufficient; the handshake handlers are not on a request goroutine that
+// carries a deadline.
+func (r *Registry) generateIceServers(roomID string) ([]protocol.IceServer, error) {
+	if r.turn == nil {
+		return []protocol.IceServer{googleStunIceServer, cloudflareStunIceServer}, nil
+	}
+	identifier := roomID + "-" + strconv.FormatInt(r.now().Unix(), 10)
+	servers, err := r.turn.Generate(context.Background(), identifier)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]protocol.IceServer, 0, len(servers)+2)
+	out = append(out, googleStunIceServer)
+	out = append(out, cloudflareStunIceServer)
+	for _, s := range servers {
+		out = append(out, protocol.IceServer{
+			URLs:       s.URLs,
+			Username:   s.Username,
+			Credential: s.Credential,
+		})
+	}
+	return out, nil
+}
 
 // generateRoomID produces a collision-checked room id of the form
 // `[shard][nid]` (see docs/ROOM_ID_SPEC.md and internal/roomid). Collisions

@@ -97,12 +97,14 @@ await guest.joinRoom({ roomId });
 Notes:
 
 - `url` is the single-endpoint shorthand, good for a local server. Production
-  deployments pass `manifest` instead, so clients discover shards and TURN
-  credentials at runtime — see [Shard manifest](#shard-manifest). Exactly one of
-  the two is required.
+  deployments pass `manifest` instead, so clients discover shards at runtime —
+  see [Shard manifest](#shard-manifest). Exactly one of the two is required.
+  TURN credentials come from the server's handshake response, not the manifest
+  — see [TURN credentials](#turn-credentials).
 - The host's peer is built only after `guest-joined` fires; the guest's is
-  built immediately on `joinRoom`. Don't construct one yourself — pass ICE
-  configuration via `PeerConnectionOptions.rtc`.
+  built immediately on `joinRoom`. Don't construct one yourself — the server
+  supplies ICE configuration in the handshake response, and an app can
+  override it via `PeerConnectionOptions.rtc`.
 - After `connect`, the server releases both sockets (close `4200`) and
   renegotiation flows peer-to-peer over a dedicated control channel, separate
   from application data. The client handles this for you.
@@ -134,8 +136,10 @@ from a URL you control.
   not a deploy.
 - The **guest loads the same manifest and picks the shard that owns the room id**
   it was given, so it lands on the process holding the room.
-- The manifest is also the client's config file: it carries the ICE/TURN
-  servers, so credentials and relay policy rotate server-side.
+- The manifest is the client's shard directory. ICE/TURN configuration is not
+  carried here: the server mints short-lived TURN credentials per connection
+  and returns them in the handshake responses, so credentials rotate without a
+  manifest republish — see [TURN credentials](#turn-credentials).
 
 ### Manifest format
 
@@ -147,15 +151,6 @@ from a URL you control.
     { "name": "k", "url": "wss://k.signal.example/v1/signal", "weight": 1 },
     { "name": "m", "url": "wss://m.signal.example/v1/signal", "weight": 0 }
   ],
-  "iceServers": [
-    { "urls": "stun:stun.l.google.com:19302" },
-    {
-      "urls": ["turn:turn.example.org:3478"],
-      "username": "rotating-user",
-      "credential": "rotating-credential"
-    }
-  ],
-  "iceTransportPolicy": "all",
   "settings": { "anything": "your app wants" }
 }
 ```
@@ -166,8 +161,6 @@ from a URL you control.
 | `shards[].name` | The shard's `SHARD_NAME` — the room-id prefix it owns. `"*"` is a wildcard that matches every room id. |
 | `shards[].url` | The shard's WebSocket endpoint. Must be `ws://` or `wss://`. |
 | `shards[].weight` | Relative share of **new** rooms. Optional, defaults to `1`. `0` drains the shard. |
-| `iceServers` | `RTCIceServer[]` applied to every peer connection. |
-| `iceTransportPolicy` | `"all"` (default) or `"relay"` to force traffic through TURN. |
 | `settings` | Opaque application config. The client never reads it; get it from `peer.currentManifest?.settings`. |
 
 A copy of this example lives at `docs/signal-manifest.example.json`.
@@ -249,23 +242,48 @@ one-wildcard-shard manifest.
   `rejoin(session)` return to the same shard, because that is where the room is
   — a manifest edit never moves a live room.
 
-### TURN through the manifest
+### TURN credentials
 
-`iceServers` in the manifest are applied to every peer generation, including
-peers rebuilt after a reconnect, so rotated TURN credentials take effect without
-an app deploy. Anything the application passes in `rtc.config` wins over the
-manifest, per field:
+The server builds the `iceServers` array for every handshake response
+(`create-room-response`, `join-room-response`, `rejoin-room-response`):
+**Google's public STUN server is always included**, and when TURN is configured,
+short-lived Cloudflare TURN credentials are appended. The client applies them to
+each peer generation, including peers rebuilt after a reconnect, so a `rejoin`
+rotates credentials without an app deploy. Anything the application passes in
+`rtc.config.iceServers` wins over the server-provided set:
 
 ```ts
 const peer = new PeerConnection({
   manifest: { url: "https://config.example.com/signal-manifest.json" },
-  // Overrides the manifest's iceServers; iceTransportPolicy still comes
-  // from the manifest.
+  // Overrides the server-provided iceServers.
   rtc: { config: { iceServers: [{ urls: "stun:stun.l.google.com:19302" }] } },
 });
 ```
 
-See [TURN guidance](#turn-guidance) for choosing and verifying TURN servers.
+When the server is not configured to mint TURN credentials (the default), the
+`iceServers` field still carries Google's STUN server, so clients always have a
+STUN path. See [TURN guidance](#turn-guidance) for choosing and verifying TURN
+servers.
+
+#### Server-side setup
+
+The server uses the [Cloudflare Calls TURN API](https://developers.cloudflare.com/realtime/turn/generate-credentials/)
+to mint credentials. Create a TURN key in the Cloudflare dashboard, then set
+these environment variables on the signaling server:
+
+| Variable | Meaning |
+| --- | --- |
+| `TURN_KEY_ID` | The TURN key id (shown in the dashboard). |
+| `TURN_KEY_API_TOKEN` | The TURN key's API token (shown once at creation). |
+| `TURN_CREDENTIAL_TTL_SEC` | Credential lifetime in seconds. Optional, defaults to `14400` (4 hours). |
+
+Both `TURN_KEY_ID` and `TURN_KEY_API_TOKEN` must be set together; the server
+refuses to start if only one is present. When both are unset (the default),
+TURN is disabled and the `iceServers` field carries only Google's STUN server.
+The key material stays server-side — only the short-lived username/credential
+pair is sent to clients. Each credential is tagged with `roomId-unixTimestamp`
+in Cloudflare's analytics so usage can be aggregated per session even when room
+ids are recycled.
 
 ### Inspecting the resolution
 
@@ -282,8 +300,8 @@ new PeerConnection({ manifest: { static: M }, shardRandom: () => 0 }); // always
 ```
 
 The pieces are exported standalone too — `parseManifest`, `ManifestProvider`,
-`selectShard`, `shardForRoomId`, `singleShardManifest`, `applyManifestRtcConfig`,
-and `ManifestError` — if you want to resolve or validate a manifest yourself.
+`selectShard`, `shardForRoomId`, `singleShardManifest`, and `ManifestError` —
+if you want to resolve or validate a manifest yourself.
 
 ## Data channels
 
@@ -538,13 +556,27 @@ application must handle them:
 
 Data-channel tests on a local network can give a false impression that a
 media application is production-ready. Voice/video users are far more likely
-to encounter restrictive NATs and corporate networks. Provide STUN and TURN
-servers through `simplePeer.config`:
+to encounter restrictive NATs and corporate networks. The recommended path is
+to configure the signaling server to mint short-lived TURN credentials via the
+Cloudflare Calls TURN API — see [TURN credentials](#turn-credentials). The
+server then returns an `iceServers` array in every handshake response and the
+client applies it automatically, so no client-side configuration is needed:
 
 ```ts
 const peer = new PeerConnection({
   url: "wss://signal.example/v1/signal",
-  simplePeer: {
+  // No rtc.config needed — the server supplies iceServers.
+});
+```
+
+To supply your own STUN/TURN servers instead (or in addition), override via
+`rtc.config.iceServers`; locally supplied values win over the server-provided
+set:
+
+```ts
+const peer = new PeerConnection({
+  url: "wss://signal.example/v1/signal",
+  rtc: {
     config: {
       iceServers: [
         { urls: "stun:stun.l.google.com:19302" },
@@ -559,9 +591,9 @@ const peer = new PeerConnection({
 });
 ```
 
-For real deployments, use **authenticated TURN** (rotating credentials via
-`credentialType: "otp"` when your TURN server supports it). Verify relay
-candidates by inspecting `RTCStatsReport` from `peer.getStats()` — look for
+For real deployments, use **authenticated TURN** with rotating credentials —
+the server-provided path does this automatically. Verify relay candidates by
+inspecting `RTCStatsReport` from `peer.getStats()` — look for
 `candidateType: "relay"` in the ICE candidate pair reports. Avoid logging
 SDP, candidate IPs, or device labels from stats by default.
 
@@ -600,7 +632,7 @@ prefer the wrapper-level media and channel methods for ordinary use.
 - `package.json` — root package face for `@simple-webrtc/client` (installed via GitHub release tarballs).
 - `scripts/` — `build.sh` (Go server binary), `release-client.sh` (client release tarball).
 - `docs/DESIGN.md` — protocol, state machine, and configuration reference.
-- `docs/signal-manifest.example.json` — example client manifest (shard directory + ICE config).
+- `docs/signal-manifest.example.json` — example client manifest (shard directory).
 
 ## Building from source
 

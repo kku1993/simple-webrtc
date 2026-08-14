@@ -18,6 +18,9 @@ client in `docs/DESIGN.md`.
   `docs/ROOM_ID_SPEC.md` (`[shard][nid]`, e.g. `ta0000`; Crockford base32
   fuzzy decoding on input).
 - `src/internal/turnstile/` — Cloudflare Turnstile siteverify client.
+- `src/internal/turn/` — Cloudflare Calls TURN credential client; mints
+  short-lived `iceServers` arrays minted per handshake when `TURN_KEY_ID` /
+  `TURN_KEY_API_TOKEN` are configured.
 - `src/internal/metrics/` — Prometheus instruments.
 - `src/internal/requestlog/` — JSON request logging (HTTP + WebSocket).
 - `src/internal/server/` — WebSocket endpoint, origin check, handshake timeout,
@@ -83,8 +86,10 @@ than depending on `simple-peer` — see `docs/RTC_ENGINE_PLAN.md`. Full notes in
 - `client/src/roomid.ts` — frontend room id normalization (Crockford base32
   fuzzy decoding, no validation; backend owns rejection).
 - `client/src/manifest.ts` — the client manifest: shard directory (weighted
-  selection for hosts, room-id prefix lookup for guests) plus ICE/TURN config,
-  loaded from a URL or a static object. See README §"Shard manifest".
+  selection for hosts, room-id prefix lookup for guests), loaded from a URL or
+  a static object. ICE/TURN config is not carried here; the server mints
+  short-lived TURN credentials and returns them in the handshake responses.
+  See README §"Shard manifest" and §"TURN credentials".
 - `client/src/index.ts` — public barrel.
 - `client/test/` — `node:test` suite. `fakes.ts` provides a fake WebSocket and a
   fake peer for protocol tests; `rtc-fakes.ts` provides a fake
@@ -103,7 +108,7 @@ npm install-scripts approve esbuild   # one-off: unblock tsx's postinstall
 npm run build       # tsc -p tsconfig.build.json  -> dist/
 npm run typecheck   # tsc -p tsconfig.json --noEmit (src + test)
 npm run lint        # eslint .  (flat config, type-checked)
-npm test            # node --test --import tsx test/*.test.ts (196 tests)
+npm test            # node --test --import tsx test/*.test.ts (197 tests)
 ```
 
 The client has **no runtime dependencies**. Keep it that way.

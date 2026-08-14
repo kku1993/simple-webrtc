@@ -6,6 +6,19 @@
 
 export type Role = 'host' | 'guest';
 
+/**
+ * One entry of the `iceServers` array the server returns in the handshake
+ * responses. Mirrors the WebRTC `RTCIceServer` dictionary so the array can be
+ * handed straight to an `RTCPeerConnection`. The TURN `username`/`credential`
+ * pair is short-lived and minted by the server; see `docs/DESIGN.md`
+ * §"CreateRoom".
+ */
+export interface IceServer {
+  urls: string[];
+  username?: string;
+  credential?: string;
+}
+
 /** Common envelope fields for every client→server message. */
 export interface ClientMessageBase {
   type: string;
@@ -78,6 +91,8 @@ export interface CreateRoomResponse extends ServerMessageBase {
   roomExpiresAt: string;
   roomExpiresInSeconds: number;
   rejoinTokenExpiresAt: string;
+  /** Server-minted STUN/TURN servers; omitted when TURN is not configured. */
+  iceServers?: IceServer[];
 }
 
 export interface JoinRoomResponse extends ServerMessageBase {
@@ -91,6 +106,8 @@ export interface JoinRoomResponse extends ServerMessageBase {
   roomExpiresAt: string;
   roomExpiresInSeconds: number;
   rejoinTokenExpiresAt: string;
+  /** Server-minted STUN/TURN servers; omitted when TURN is not configured. */
+  iceServers?: IceServer[];
 }
 
 export interface RejoinRoomResponse extends ServerMessageBase {
@@ -106,6 +123,8 @@ export interface RejoinRoomResponse extends ServerMessageBase {
   roomExpiresAt: string;
   roomExpiresInSeconds: number;
   rejoinTokenExpiresAt: string;
+  /** Server-minted STUN/TURN servers; omitted when TURN is not configured. */
+  iceServers?: IceServer[];
 }
 
 export interface SignalResponseMessage extends ServerMessageBase {

@@ -156,3 +156,63 @@ func TestLoadOverride(t *testing.T) {
 		t.Errorf("MaxRoomsGlobal = %d, want 10", c.MaxRoomsGlobal)
 	}
 }
+
+func TestLoadTurnDefaultsDisabled(t *testing.T) {
+	validBaseEnv(t)
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.TurnEnabled() {
+		t.Errorf("TURN should be disabled by default")
+	}
+	if c.TurnCredentialTtlSec != 14400 {
+		t.Errorf("TurnCredentialTtlSec default = %d, want 14400", c.TurnCredentialTtlSec)
+	}
+}
+
+func TestLoadTurnRequiresBothHalves(t *testing.T) {
+	validBaseEnv(t)
+	// Only the key id, no token.
+	setEnv(t, "TURN_KEY_ID", "kid")
+	os.Unsetenv("TURN_KEY_API_TOKEN")
+	if _, err := Load(); err == nil {
+		t.Fatalf("expected error when only TURN_KEY_ID is set")
+	}
+	// Only the token, no key id.
+	os.Unsetenv("TURN_KEY_ID")
+	setEnv(t, "TURN_KEY_API_TOKEN", "tok")
+	if _, err := Load(); err == nil {
+		t.Fatalf("expected error when only TURN_KEY_API_TOKEN is set")
+	}
+}
+
+func TestLoadTurnEnabledWithBothHalves(t *testing.T) {
+	validBaseEnv(t)
+	setEnv(t, "TURN_KEY_ID", "kid")
+	setEnv(t, "TURN_KEY_API_TOKEN", "tok")
+	setEnv(t, "TURN_CREDENTIAL_TTL_SEC", "7200")
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !c.TurnEnabled() {
+		t.Errorf("TurnEnabled should be true")
+	}
+	if c.TurnCredentialTtlSec != 7200 {
+		t.Errorf("TurnCredentialTtlSec = %d, want 7200", c.TurnCredentialTtlSec)
+	}
+	if c.TurnCredentialTtl() != 7200*1e9 {
+		t.Errorf("TurnCredentialTtl = %v, want %v", c.TurnCredentialTtl(), 7200*1e9)
+	}
+}
+
+func TestLoadTurnRejectsNonPositiveTTL(t *testing.T) {
+	validBaseEnv(t)
+	setEnv(t, "TURN_KEY_ID", "kid")
+	setEnv(t, "TURN_KEY_API_TOKEN", "tok")
+	setEnv(t, "TURN_CREDENTIAL_TTL_SEC", "0")
+	if _, err := Load(); err == nil {
+		t.Fatalf("expected error for non-positive TURN_CREDENTIAL_TTL_SEC")
+	}
+}

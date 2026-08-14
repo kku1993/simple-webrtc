@@ -25,7 +25,9 @@ until they establish a direct peer-to-peer connection, then get out of the way.
 - Persistence of any kind across process restarts.
 - Rooms with more than two participants.
 - Relaying media or application data. Only signaling passes through here.
-- TURN/STUN. Configure those separately in the simple-peer client.
+- TURN/STUN relaying. The server mints short-lived TURN credentials via the
+  Cloudflare Calls TURN API and returns them in the handshake responses, but it
+  does not relay media or ICE traffic itself.
 
 ## Terminology
 
@@ -274,6 +276,10 @@ Success:
   roomExpiresAt: string;          // ISO; in-memory lifetime of this room instance
   roomExpiresInSeconds: number;   // default 5400
   rejoinTokenExpiresAt: string;   // ISO; after this, the pairing cannot be rebuilt
+  iceServers?: IceServer[];       // STUN/TURN servers. Google's public STUN server is always
+                                  // included; when TURN is configured, short-lived Cloudflare
+                                  // TURN credentials are appended. Applied to every peer
+                                  // generation; an app's rtc.config.iceServers wins
 }
 ```
 
@@ -312,6 +318,9 @@ Success:
   roomExpiresAt: string;
   roomExpiresInSeconds: number;
   rejoinTokenExpiresAt: string;
+  iceServers?: IceServer[];    // STUN/TURN servers. Google's public STUN is always included;
+                               // when TURN is configured, short-lived Cloudflare TURN
+                               // credentials are appended
 }
 ```
 
@@ -370,6 +379,10 @@ Success:
   roomExpiresAt: string;
   roomExpiresInSeconds: number;
   rejoinTokenExpiresAt: string;
+  iceServers?: IceServer[];  // STUN/TURN servers. Google's public STUN is always included;
+                              // when TURN is configured, short-lived Cloudflare TURN credentials
+                              // are appended. Reissues a fresh credential set on every rejoin
+                              // so reconnects rotate TURN
 }
 ```
 
@@ -1017,14 +1030,20 @@ Routing is done **in the client**, not at the edge: the client fetches a JSON
 manifest listing every shard (name, URL, weight) from a URL the operator
 controls. A host loads it before creating a room and picks a shard by weighted
 random choice; a guest loads it and picks the shard whose name prefixes the
-room id it was given. The manifest also carries the ICE/TURN configuration, so
-it doubles as the client's config file.
+room id it was given. The manifest is the shard directory only; ICE/TURN
+configuration is not carried there. Instead the server builds the `iceServers`
+array for every handshake response (`create-room-response`,
+`join-room-response`, `rejoin-room-response`): Google's public STUN server is
+always included, and when TURN is configured, short-lived Cloudflare TURN
+credentials are appended, so credentials rotate without a manifest republish.
 
 This keeps the edge dumb (TLS termination and WebSocket upgrade passthrough,
 nothing more) and makes rebalancing and draining a config change rather than a
 deploy. The format, hosting requirements, and operational procedures are in the
 README under "Shard manifest"; an example manifest is at
-`docs/signal-manifest.example.json`.
+`docs/signal-manifest.example.json`. TURN credential minting is configured via
+`TURN_KEY_ID`, `TURN_KEY_API_TOKEN`, and `TURN_CREDENTIAL_TTL_SEC` — see the
+configuration reference below and README §"TURN credentials".
 
 ### Operational endpoints
 
@@ -1047,6 +1066,9 @@ the process is losing state.
 | `trustedProxyCount` | `TRUSTED_PROXY_COUNT` | `0` | `X-Forwarded-For` is ignored when 0 |
 | `cloudflareMode` | `CLOUDFLARE_MODE` | `false` | Prefer `CF-Connecting-IP` |
 | `turnstileSecretKey` | `TURNSTILE_SECRET_KEY` | *(unset)* | Enables bot prevention on `create-room` |
+| `turnKeyID` | `TURN_KEY_ID` | *(unset)* | Cloudflare Calls TURN key id. Must be set with `TURN_KEY_API_TOKEN`; when both are unset, only Google STUN is returned in `iceServers` |
+| `turnKeyAPIToken` | `TURN_KEY_API_TOKEN` | *(unset)* | Cloudflare Calls TURN key API token. Kept server-side; only short-lived username/credential pairs are sent to clients |
+| `turnCredentialTtlSec` | `TURN_CREDENTIAL_TTL_SEC` | `14400` | Lifetime of minted TURN credentials (4 hours). Must be positive when TURN is enabled |
 | `peerDeadlineSec` | `PEER_DEADLINE_SEC` | `600` | Applies to any room with one empty slot |
 | `roomMaxLifetimeSec` | `ROOM_MAX_LIFETIME_SEC` | `5400` | In-memory only |
 | `rejoinTokenTtlSec` | `REJOIN_TOKEN_TTL_SEC` | `43200` | Bounds recreate |
@@ -1068,6 +1090,18 @@ the process is losing state.
 
 ```typescript
 type Role = "host" | "guest";
+
+// One entry of the iceServers array returned in the handshake responses.
+// Mirrors the WebRTC RTCIceServer dictionary. Google's public STUN server is
+// always included; when TURN is configured, short-lived TURN username/credential
+// pairs minted by the server via the Cloudflare Calls TURN API (see internal/turn)
+// are appended. The credential is tagged with `roomId-unixTimestamp` for
+// per-session analytics (room ids may be recycled).
+interface IceServer {
+  urls: string[];
+  username?: string;
+  credential?: string;
+}
 
 interface Slot {
   conn: Connection | null;

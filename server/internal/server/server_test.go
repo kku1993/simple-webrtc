@@ -80,7 +80,7 @@ func newTestServer(t *testing.T, cfg config.Config) (*httptest.Server, *room.Reg
 	}
 	m := metrics.New()
 	tomb := tombstone.New(cfg.TombstoneMaxEntries, cfg.TombstoneTtl())
-	reg := room.New(cfg, signer, tomb, m)
+	reg := room.New(cfg, signer, tomb, m, nil)
 	reg.StartSweep()
 	t.Cleanup(reg.Stop)
 	srv := New(cfg, reg, m, nil, nil)
@@ -244,7 +244,7 @@ func TestServerHealthz(t *testing.T) {
 	signer, _ := token.NewSigner(cfg.ServerSecret)
 	m := metrics.New()
 	tomb := tombstone.New(cfg.TombstoneMaxEntries, cfg.TombstoneTtl())
-	reg := room.New(cfg, signer, tomb, m)
+	reg := room.New(cfg, signer, tomb, m, nil)
 	srv := New(cfg, reg, m, nil, nil)
 	hs := httptest.NewServer(http.HandlerFunc(srv.handleHealth))
 	defer hs.Close()
@@ -358,7 +358,7 @@ func TestServerRequestLog(t *testing.T) {
 	signer, _ := token.NewSigner(cfg.ServerSecret)
 	m := metrics.New()
 	tomb := tombstone.New(cfg.TombstoneMaxEntries, cfg.TombstoneTtl())
-	reg := room.New(cfg, signer, tomb, m)
+	reg := room.New(cfg, signer, tomb, m, nil)
 	reg.StartSweep()
 	t.Cleanup(reg.Stop)
 
@@ -464,7 +464,7 @@ func TestServerRequestLogHTTPRejection(t *testing.T) {
 	signer, _ := token.NewSigner(cfg.ServerSecret)
 	m := metrics.New()
 	tomb := tombstone.New(cfg.TombstoneMaxEntries, cfg.TombstoneTtl())
-	reg := room.New(cfg, signer, tomb, m)
+	reg := room.New(cfg, signer, tomb, m, nil)
 	reg.StartSweep()
 	t.Cleanup(reg.Stop)
 

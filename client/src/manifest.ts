@@ -1,4 +1,4 @@
-// Client configuration manifest: shard directory + ICE settings.
+// Client configuration manifest: shard directory.
 //
 // In production the signaling backend is a set of single-process shards, each
 // one identified by the leading character of every room id it mints (see
@@ -11,8 +11,11 @@
 //   - the **guest** loads the same manifest and picks the shard that owns the
 //     room id it was given, so it lands on the process that holds the room.
 //
-// The manifest doubles as a client config file: it also carries the ICE/TURN
-// configuration, so credentials and relay policy can be rotated server-side.
+// The manifest is the client's shard directory only. ICE/TURN configuration is
+// not carried here: the server mints short-lived TURN credentials and returns
+// them in the handshake responses (create-room / join-room / rejoin-room), so
+// credentials rotate per connection without a manifest republish. See
+// docs/DESIGN.md §"CreateRoom".
 //
 // A manifest can come from a live URL (the production default) or from a
 // static object compiled into the app (local development and tests).
@@ -63,13 +66,6 @@ export interface SignalManifest {
   version: number;
   /** The shard directory. Must contain at least one entry. */
   shards: ShardEntry[];
-  /**
-   * ICE servers applied to every peer connection. Lets operators rotate TURN
-   * credentials without shipping a new client build.
-   */
-  iceServers?: RTCIceServer[];
-  /** ICE transport policy, e.g. `'relay'` to force traffic through TURN. */
-  iceTransportPolicy?: RTCIceTransportPolicy;
   /**
    * Arbitrary application-level settings. The client never interprets these;
    * they are parsed, carried through, and exposed via
@@ -185,17 +181,6 @@ export function parseManifest(raw: unknown): SignalManifest {
     shards,
   };
 
-  const iceServers = raw['iceServers'];
-  if (iceServers !== undefined) manifest.iceServers = parseIceServers(iceServers);
-
-  const policy = raw['iceTransportPolicy'];
-  if (policy !== undefined) {
-    if (policy !== 'all' && policy !== 'relay') {
-      throw new ManifestError("manifest.iceTransportPolicy must be 'all' or 'relay'");
-    }
-    manifest.iceTransportPolicy = policy;
-  }
-
   const settings = raw['settings'];
   if (settings !== undefined) {
     if (!isRecord(settings)) throw new ManifestError('manifest.settings must be an object');
@@ -235,33 +220,6 @@ function parseShard(entry: unknown, i: number): ShardEntry {
   }
 
   return shard;
-}
-
-function parseIceServers(raw: unknown): RTCIceServer[] {
-  if (!Array.isArray(raw)) throw new ManifestError('manifest.iceServers must be an array');
-  return raw.map((entry, i) => {
-    const at = `manifest.iceServers[${i}]`;
-    if (!isRecord(entry)) throw new ManifestError(`${at} must be an object`);
-    const urls = entry['urls'];
-    const ok =
-      typeof urls === 'string' ||
-      (Array.isArray(urls) && urls.length > 0 && urls.every((u) => typeof u === 'string'));
-    if (!ok) throw new ManifestError(`${at}.urls must be a string or a non-empty string array`);
-    const server: RTCIceServer = { urls };
-    if (entry['username'] !== undefined) {
-      if (typeof entry['username'] !== 'string') {
-        throw new ManifestError(`${at}.username must be a string`);
-      }
-      server.username = entry['username'];
-    }
-    if (entry['credential'] !== undefined) {
-      if (typeof entry['credential'] !== 'string') {
-        throw new ManifestError(`${at}.credential must be a string`);
-      }
-      server.credential = entry['credential'];
-    }
-    return server;
-  });
 }
 
 /** Build a one-shard manifest for a deployment with a single signaling URL. */
@@ -331,29 +289,6 @@ export function shardForRoomId(manifest: SignalManifest, roomId: string): ShardE
     `no shard in the manifest serves room id '${normalized}' ` +
       `(known shards: ${manifest.shards.map((s) => s.name).join(', ')})`,
   );
-}
-
-/**
- * Merge the manifest's ICE settings into an `RTCConfiguration`.
- *
- * Locally supplied values win: the manifest is an operator-managed default, so
- * an application that passes `rtc.config.iceServers` explicitly keeps control.
- */
-export function applyManifestRtcConfig(
-  manifest: SignalManifest | null,
-  base: RTCConfiguration | undefined,
-): RTCConfiguration | undefined {
-  if (!manifest) return base;
-  const hasIce = manifest.iceServers !== undefined;
-  const hasPolicy = manifest.iceTransportPolicy !== undefined;
-  if (!hasIce && !hasPolicy) return base;
-
-  const merged: RTCConfiguration = { ...base };
-  if (hasIce && merged.iceServers === undefined) merged.iceServers = manifest.iceServers;
-  if (hasPolicy && merged.iceTransportPolicy === undefined) {
-    merged.iceTransportPolicy = manifest.iceTransportPolicy;
-  }
-  return merged;
 }
 
 // ---------------------------------------------------------------------------

@@ -22,6 +22,7 @@ import (
 	"github.com/kku1993/simple-webrtc-server/internal/server"
 	"github.com/kku1993/simple-webrtc-server/internal/token"
 	"github.com/kku1993/simple-webrtc-server/internal/tombstone"
+	"github.com/kku1993/simple-webrtc-server/internal/turn"
 	"github.com/kku1993/simple-webrtc-server/internal/turnstile"
 	"github.com/kku1993/simple-webrtc-server/internal/version"
 )
@@ -61,7 +62,14 @@ func run() error {
 
 	m := metrics.New()
 	tomb := tombstone.New(cfg.TombstoneMaxEntries, cfg.TombstoneTtl())
-	reg := room.New(cfg, signer, tomb, m)
+
+	var turnClient *turn.Client
+	if cfg.TurnEnabled() {
+		turnClient = turn.New(cfg.TurnKeyID, cfg.TurnKeyAPIToken, cfg.TurnCredentialTtl())
+		log.Printf("TURN enabled; minting %s credentials via Cloudflare Calls", cfg.TurnCredentialTtl())
+	}
+
+	reg := room.New(cfg, signer, tomb, m, turnClient)
 	reg.StartSweep()
 	defer reg.Stop()
 

@@ -2,6 +2,7 @@ import {
   type ClientMessage,
   type CreateRoomResponse,
   type ErrorResponseMessage,
+  type IceServer,
   type JoinRoomResponse,
   type RejoinRoomResponse,
   type Role,
@@ -21,7 +22,6 @@ import {
   type ShardEntry,
   type SignalManifest,
   ManifestProvider,
-  applyManifestRtcConfig,
   selectShard,
   shardForRoomId,
   singleShardManifest,
@@ -381,6 +381,13 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
 
   /** Current room state, or null before a successful handshake. */
   private state: RoomState | null = null;
+  /**
+   * Server-minted ICE servers captured from the most recent handshake
+   * response. Applied to every peer generation so a reconnect (which reissues
+   * a fresh, short-lived credential via rejoin-room) rotates TURN credentials
+   * without an app deploy. `null` until the first handshake returns.
+   */
+  private iceServers: IceServer[] | null = null;
   /** The underlying peer instance, when one exists. */
   private peer: RtcPeerLike | null = null;
   private seq = new SequenceCounter();
@@ -1180,6 +1187,12 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
       rejoinTokenExpiresAt: res.rejoinTokenExpiresAt,
     };
     this.state = state;
+    // Capture the server-minted ICE servers so the next peer generation (and
+    // any rebuild after a reconnect) picks up the fresh, short-lived TURN
+    // credentials. A rejoin response reissues them; an omitted field leaves
+    // the previously captured set in place so a server that drops the field
+    // mid-session does not strip TURN from an established connection.
+    if (res.iceServers !== undefined) this.iceServers = res.iceServers;
     this.persistSession();
     this.emit('state', { ...state });
   }
@@ -1243,9 +1256,11 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
   private maybeBuildPeer(opts: { initiator: boolean }): boolean {
     if (this.peer) return false;
     const initiator = opts.initiator;
-    // ICE servers from the manifest are operator-managed defaults; anything the
-    // application set in `rtc.config` wins.
-    const config = applyManifestRtcConfig(this.manifest, this.rtcOpts.config);
+    // ICE servers come from the server's handshake response (short-lived TURN
+    // credentials minted per connection). Anything the application set in
+    // `rtc.config.iceServers` wins, so an app that supplies its own STUN/TURN
+    // keeps control; otherwise the server-provided set is applied.
+    const config = applyServerIceServers(this.iceServers, this.rtcOpts.config);
     const peer = this.createPeer({
       ...this.rtcOpts,
       ...(config !== undefined ? { config } : {}),
@@ -1713,4 +1728,26 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
   private emitClose(reason: string): void {
     this.emit('close', { reason });
   }
+}
+
+// ---------------------------------------------------------------------------
+// Module-level helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Merge server-provided ICE servers into an `RTCConfiguration`.
+ *
+ * The server mints short-lived TURN credentials per handshake and returns them
+ * in `iceServers`. Locally supplied values win: an application that passes
+ * `rtc.config.iceServers` explicitly keeps control of its own STUN/TURN set.
+ * Returns `undefined` when neither side contributes ICE config, so the peer is
+ * built with no `config` override at all (the browser's defaults apply).
+ */
+function applyServerIceServers(
+  iceServers: IceServer[] | null,
+  base: RTCConfiguration | undefined,
+): RTCConfiguration | undefined {
+  if (!iceServers || iceServers.length === 0) return base;
+  if (base?.iceServers !== undefined) return base;
+  return { ...base, iceServers };
 }

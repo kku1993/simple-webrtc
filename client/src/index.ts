@@ -55,6 +55,7 @@ export {
   type ClientMessage,
   type ServerMessage,
   type Role,
+  type IceServer,
   type CreateRoomMessage,
   type JoinRoomMessage,
   type RejoinRoomMessage,
@@ -84,7 +85,7 @@ export { Transport, type WebSocketFactory, type WebSocketLike, parseFrame } from
 
 export { normalizeRoomId } from './roomid.js';
 
-// The client manifest: shard directory + ICE/TURN configuration.
+// The client manifest: shard directory.
 export {
   ManifestProvider,
   ManifestError,
@@ -92,7 +93,6 @@ export {
   singleShardManifest,
   selectShard,
   shardForRoomId,
-  applyManifestRtcConfig,
   WILDCARD_SHARD,
   MANIFEST_VERSION,
   DEFAULT_MANIFEST_TTL_MS,

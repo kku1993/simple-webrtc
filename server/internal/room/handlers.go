@@ -110,6 +110,16 @@ func (r *Registry) CreateRoom(s *Session, m protocol.CreateRoomMsg, turnstileOK 
 		return errResult(protocol.ErrServerAtCapacity, "could not allocate room id", m.RequestID, nil)
 	}
 
+	// Mint short-lived TURN credentials before the room is published, so a
+	// failure rolls back the per-IP and global counters without leaving an
+	// orphaned room. Omitted (nil) when TURN is not configured.
+	iceServers, err := r.generateIceServers(roomID)
+	if err != nil {
+		r.roomsPerIP.Decrement(ip)
+		r.releaseGlobalRoomSlot()
+		return errResult(protocol.ErrServerAtCapacity, "could not generate TURN credentials", m.RequestID, nil)
+	}
+
 	now := r.now()
 	room := &Room{
 		reg:             r,
@@ -175,6 +185,7 @@ func (r *Registry) CreateRoom(s *Session, m protocol.CreateRoomMsg, turnstileOK 
 		RoomExpiresAt:         isoTime(room.expiresAt),
 		RoomExpiresInSeconds:  secondsUntil(now, room.expiresAt),
 		RejoinTokenExpiresAt:  isoTime(room.createdAt.Add(r.cfg.RejoinTokenTtl())),
+		IceServers:            iceServers,
 	}
 	return Result{Response: resp}
 }
@@ -237,6 +248,13 @@ func (r *Registry) JoinRoom(s *Session, m protocol.JoinRoomMsg) Result {
 		return errResult(protocol.ErrRoomFull, "room is full", m.RequestID, nil)
 	}
 
+	// Mint short-lived TURN credentials before attaching, so a failure leaves
+	// the slot untouched. Omitted (nil) when TURN is not configured.
+	iceServers, err := r.generateIceServers(room.roomID)
+	if err != nil {
+		return errResult(protocol.ErrServerAtCapacity, "could not generate TURN credentials", m.RequestID, nil)
+	}
+
 	// Attach guest.
 	guestSlot.conn = s.conn
 	guestSlot.epoch = m.GuestEpoch
@@ -285,6 +303,7 @@ func (r *Registry) JoinRoom(s *Session, m protocol.JoinRoomMsg) Result {
 		RoomExpiresAt:        isoTime(room.expiresAt),
 		RoomExpiresInSeconds: secondsUntil(now, room.expiresAt),
 		RejoinTokenExpiresAt: isoTime(room.createdAt.Add(r.cfg.RejoinTokenTtl())),
+		IceServers:           iceServers,
 	}
 	return Result{Response: resp}
 }
@@ -331,6 +350,14 @@ func (r *Registry) RejoinRoom(s *Session, m protocol.RejoinRoomMsg) Result {
 	r.mu.Lock()
 	room, ok := r.rooms[p.RoomID]
 	r.mu.Unlock()
+
+	// Mint short-lived TURN credentials before any recreate or slot attach, so
+	// a failure requires no rollback (the recreate path has not yet allocated
+	// counters or published a room). Omitted (nil) when TURN is not configured.
+	iceServers, err := r.generateIceServers(p.RoomID)
+	if err != nil {
+		return errResult(protocol.ErrServerAtCapacity, "could not generate TURN credentials", m.RequestID, nil)
+	}
 
 	recreated := false
 	if !ok {
@@ -463,6 +490,7 @@ func (r *Registry) RejoinRoom(s *Session, m protocol.RejoinRoomMsg) Result {
 		RoomExpiresAt:        isoTime(room.expiresAt),
 		RoomExpiresInSeconds: secondsUntil(now, room.expiresAt),
 		RejoinTokenExpiresAt: isoTime(room.createdAt.Add(r.cfg.RejoinTokenTtl())),
+		IceServers:           iceServers,
 	}
 	if otherSlot.conn == nil && room.peerDeadlineAt != nil {
 		d := *room.peerDeadlineAt

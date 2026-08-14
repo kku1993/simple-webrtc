@@ -183,47 +183,61 @@ type CloseRoomMsg struct {
 
 // --- Server → client messages ---
 
+// IceServer is one entry of the iceServers array returned in the handshake
+// responses. It mirrors the WebRTC RTCIceServer dictionary so the array can be
+// handed straight to an RTCPeerConnection. The TURN username/credential pair
+// is short-lived and minted by the server via the Cloudflare Calls TURN API —
+// see internal/turn.
+type IceServer struct {
+	URLs       []string `json:"urls"`
+	Username   string   `json:"username,omitempty"`
+	Credential string   `json:"credential,omitempty"`
+}
+
 type CreateRoomResponse struct {
-	Type                    string `json:"type"`
-	RequestID               string `json:"requestId,omitempty"`
-	RoomID                  string `json:"roomId"`
-	Role                    Role   `json:"role"`
-	RejoinToken             string `json:"rejoinToken"`
-	PeerDeadlineAt          string `json:"peerDeadlineAt"`
-	PeerDeadlineInSeconds   int    `json:"peerDeadlineInSeconds"`
-	RoomExpiresAt           string `json:"roomExpiresAt"`
-	RoomExpiresInSeconds    int    `json:"roomExpiresInSeconds"`
-	RejoinTokenExpiresAt    string `json:"rejoinTokenExpiresAt"`
+	Type                    string      `json:"type"`
+	RequestID               string      `json:"requestId,omitempty"`
+	RoomID                  string      `json:"roomId"`
+	Role                    Role        `json:"role"`
+	RejoinToken             string      `json:"rejoinToken"`
+	PeerDeadlineAt          string      `json:"peerDeadlineAt"`
+	PeerDeadlineInSeconds   int         `json:"peerDeadlineInSeconds"`
+	RoomExpiresAt           string      `json:"roomExpiresAt"`
+	RoomExpiresInSeconds    int         `json:"roomExpiresInSeconds"`
+	RejoinTokenExpiresAt    string      `json:"rejoinTokenExpiresAt"`
+	IceServers              []IceServer `json:"iceServers,omitempty"`
 }
 
 type JoinRoomResponse struct {
-	Type                  string  `json:"type"`
-	RequestID             string  `json:"requestId,omitempty"`
-	RoomID                string  `json:"roomId"`
-	Role                  Role    `json:"role"`
-	RejoinToken           string  `json:"rejoinToken"`
-	HostConnected         bool    `json:"hostConnected"`
-	HostEpoch             *string `json:"hostEpoch"`
-	GuestEpoch            string  `json:"guestEpoch"`
-	RoomExpiresAt         string  `json:"roomExpiresAt"`
-	RoomExpiresInSeconds  int     `json:"roomExpiresInSeconds"`
-	RejoinTokenExpiresAt  string  `json:"rejoinTokenExpiresAt"`
+	Type                  string      `json:"type"`
+	RequestID             string      `json:"requestId,omitempty"`
+	RoomID                string      `json:"roomId"`
+	Role                  Role        `json:"role"`
+	RejoinToken           string      `json:"rejoinToken"`
+	HostConnected         bool        `json:"hostConnected"`
+	HostEpoch             *string     `json:"hostEpoch"`
+	GuestEpoch            string      `json:"guestEpoch"`
+	RoomExpiresAt         string      `json:"roomExpiresAt"`
+	RoomExpiresInSeconds  int         `json:"roomExpiresInSeconds"`
+	RejoinTokenExpiresAt  string      `json:"rejoinTokenExpiresAt"`
+	IceServers            []IceServer `json:"iceServers,omitempty"`
 }
 
 type RejoinRoomResponse struct {
-	Type                    string  `json:"type"`
-	RequestID               string  `json:"requestId,omitempty"`
-	RoomID                  string  `json:"roomId"`
-	Role                    Role    `json:"role"`
-	Recreated               bool    `json:"recreated"`
-	PeerConnected           bool    `json:"peerConnected"`
-	HostEpoch               *string `json:"hostEpoch"`
-	GuestEpoch              *string `json:"guestEpoch"`
-	PeerDeadlineAt          *string `json:"peerDeadlineAt"`
-	PeerDeadlineInSeconds   *int    `json:"peerDeadlineInSeconds"`
-	RoomExpiresAt           string  `json:"roomExpiresAt"`
-	RoomExpiresInSeconds    int     `json:"roomExpiresInSeconds"`
-	RejoinTokenExpiresAt    string  `json:"rejoinTokenExpiresAt"`
+	Type                    string      `json:"type"`
+	RequestID               string      `json:"requestId,omitempty"`
+	RoomID                  string      `json:"roomId"`
+	Role                    Role        `json:"role"`
+	Recreated               bool        `json:"recreated"`
+	PeerConnected           bool        `json:"peerConnected"`
+	HostEpoch               *string     `json:"hostEpoch"`
+	GuestEpoch              *string     `json:"guestEpoch"`
+	PeerDeadlineAt          *string     `json:"peerDeadlineAt"`
+	PeerDeadlineInSeconds   *int       `json:"peerDeadlineInSeconds"`
+	RoomExpiresAt           string      `json:"roomExpiresAt"`
+	RoomExpiresInSeconds    int         `json:"roomExpiresInSeconds"`
+	RejoinTokenExpiresAt    string      `json:"rejoinTokenExpiresAt"`
+	IceServers              []IceServer `json:"iceServers,omitempty"`
 }
 
 // SignalResponse documents the server→client signal-response shape. It is not
