@@ -46,10 +46,54 @@ type Config struct {
 	MaxRoomsPerIp               int
 }
 
+// FlagOverrides holds optional command-line overrides for every configurable
+// field. A nil pointer means "not supplied on the command line"; LoadWithOverrides
+// falls back to the corresponding environment variable (and then the built-in
+// default) for nil entries. Non-nil entries take precedence over both the
+// environment variable and the default — this is how a command-line flag
+// overrides its env-var counterpart.
+type FlagOverrides struct {
+	ListenAddr                    *string
+	ServerSecret                  *string
+	AllowedOrigins                *string
+	ShardName                     *string
+	TrustedProxyCount             *int
+	CloudflareMode                *bool
+	TurnstileSecretKey            *string
+	TurnKeyID                     *string
+	TurnKeyAPIToken               *string
+	TurnCredentialTtlSec          *int
+	PeerDeadlineSec               *int
+	RoomMaxLifetimeSec            *int
+	RejoinTokenTtlSec             *int
+	ReleaseSocketsOnPeerConnected *bool
+	PeerConnectedGraceSec         *int
+	MaxFrameBytes                 *int
+	MaxBufferedSignals            *int
+	MaxBufferedSignalBytes        *int
+	MaxPasswordAttempts           *int
+	HandshakeTimeoutMs            *int
+	PingIntervalSec               *int
+	TombstoneMaxEntries           *int
+	TombstoneTtlSec               *int
+	MaxRoomsGlobal                *int
+	MaxConnectionsGlobal          *int
+	MaxRoomsPerIp                 *int
+}
+
 // Load reads configuration from the process environment, applies defaults, and
-// validates the result. It returns a non-nil error if the configuration is
-// invalid or incomplete in a way that should prevent startup.
+// validates the result. It is equivalent to LoadWithOverrides with no overrides
+// (every field falls back to env var / default).
 func Load() (Config, error) {
+	return LoadWithOverrides(FlagOverrides{})
+}
+
+// LoadWithOverrides reads configuration from the process environment, then
+// applies any non-nil command-line overrides on top, and validates the result.
+// A non-nil override wins over both the env var and the default. It returns a
+// non-nil error if the configuration is invalid or incomplete in a way that
+// should prevent startup.
+func LoadWithOverrides(o FlagOverrides) (Config, error) {
 	c := Config{
 		ListenAddr:                    ":8080",
 		PeerDeadlineSec:               600,
@@ -167,6 +211,87 @@ func Load() (Config, error) {
 	}
 	if err := getInt("MAX_ROOMS_PER_IP", &c.MaxRoomsPerIp); err != nil {
 		return Config{}, err
+	}
+
+	// Command-line overrides win over env vars and defaults. Applied after the
+	// env pass so a flag always takes precedence.
+	if o.ListenAddr != nil {
+		c.ListenAddr = *o.ListenAddr
+	}
+	if o.ServerSecret != nil {
+		c.ServerSecret = []byte(*o.ServerSecret)
+	}
+	if o.AllowedOrigins != nil {
+		c.AllowedOrigins = parseOrigins(*o.AllowedOrigins)
+	}
+	if o.ShardName != nil {
+		c.ShardName = *o.ShardName
+	}
+	if o.TrustedProxyCount != nil {
+		c.TrustedProxyCount = *o.TrustedProxyCount
+	}
+	if o.CloudflareMode != nil {
+		c.CloudflareMode = *o.CloudflareMode
+	}
+	if o.TurnstileSecretKey != nil {
+		c.TurnstileSecretKey = *o.TurnstileSecretKey
+	}
+	if o.TurnKeyID != nil {
+		c.TurnKeyID = *o.TurnKeyID
+	}
+	if o.TurnKeyAPIToken != nil {
+		c.TurnKeyAPIToken = *o.TurnKeyAPIToken
+	}
+	if o.TurnCredentialTtlSec != nil {
+		c.TurnCredentialTtlSec = *o.TurnCredentialTtlSec
+	}
+	if o.PeerDeadlineSec != nil {
+		c.PeerDeadlineSec = *o.PeerDeadlineSec
+	}
+	if o.RoomMaxLifetimeSec != nil {
+		c.RoomMaxLifetimeSec = *o.RoomMaxLifetimeSec
+	}
+	if o.RejoinTokenTtlSec != nil {
+		c.RejoinTokenTtlSec = *o.RejoinTokenTtlSec
+	}
+	if o.ReleaseSocketsOnPeerConnected != nil {
+		c.ReleaseSocketsOnPeerConnected = *o.ReleaseSocketsOnPeerConnected
+	}
+	if o.PeerConnectedGraceSec != nil {
+		c.PeerConnectedGraceSec = *o.PeerConnectedGraceSec
+	}
+	if o.MaxFrameBytes != nil {
+		c.MaxFrameBytes = *o.MaxFrameBytes
+	}
+	if o.MaxBufferedSignals != nil {
+		c.MaxBufferedSignals = *o.MaxBufferedSignals
+	}
+	if o.MaxBufferedSignalBytes != nil {
+		c.MaxBufferedSignalBytes = *o.MaxBufferedSignalBytes
+	}
+	if o.MaxPasswordAttempts != nil {
+		c.MaxPasswordAttempts = *o.MaxPasswordAttempts
+	}
+	if o.HandshakeTimeoutMs != nil {
+		c.HandshakeTimeoutMs = *o.HandshakeTimeoutMs
+	}
+	if o.PingIntervalSec != nil {
+		c.PingIntervalSec = *o.PingIntervalSec
+	}
+	if o.TombstoneMaxEntries != nil {
+		c.TombstoneMaxEntries = *o.TombstoneMaxEntries
+	}
+	if o.TombstoneTtlSec != nil {
+		c.TombstoneTtlSec = *o.TombstoneTtlSec
+	}
+	if o.MaxRoomsGlobal != nil {
+		c.MaxRoomsGlobal = *o.MaxRoomsGlobal
+	}
+	if o.MaxConnectionsGlobal != nil {
+		c.MaxConnectionsGlobal = *o.MaxConnectionsGlobal
+	}
+	if o.MaxRoomsPerIp != nil {
+		c.MaxRoomsPerIp = *o.MaxRoomsPerIp
 	}
 
 	return c, c.Validate()

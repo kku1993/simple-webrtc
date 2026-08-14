@@ -216,3 +216,104 @@ func TestLoadTurnRejectsNonPositiveTTL(t *testing.T) {
 		t.Fatalf("expected error for non-positive TURN_CREDENTIAL_TTL_SEC")
 	}
 }
+
+func TestLoadWithOverridesFallbackToEnv(t *testing.T) {
+	validBaseEnv(t)
+	// No overrides at all: behaves exactly like Load().
+	c, err := LoadWithOverrides(FlagOverrides{})
+	if err != nil {
+		t.Fatalf("LoadWithOverrides: %v", err)
+	}
+	if c.ShardName != "t" {
+		t.Errorf("ShardName = %q, want %q (env)", c.ShardName, "t")
+	}
+	if c.ListenAddr != ":8080" {
+		t.Errorf("ListenAddr = %q, want %q (default)", c.ListenAddr, ":8080")
+	}
+}
+
+func TestLoadWithOverridesFlagWinsOverEnv(t *testing.T) {
+	validBaseEnv(t)
+	setEnv(t, "MAX_ROOMS_GLOBAL", "10")
+	setEnv(t, "MAX_CONNECTIONS_GLOBAL", "20")
+	setEnv(t, "PEER_DEADLINE_SEC", "120")
+
+	maxRooms := 999
+	maxConns := 1234
+	peerDeadline := 77
+	c, err := LoadWithOverrides(FlagOverrides{
+		MaxRoomsGlobal:       &maxRooms,
+		MaxConnectionsGlobal: &maxConns,
+		PeerDeadlineSec:      &peerDeadline,
+	})
+	if err != nil {
+		t.Fatalf("LoadWithOverrides: %v", err)
+	}
+	if c.MaxRoomsGlobal != 999 {
+		t.Errorf("MaxRoomsGlobal = %d, want 999 (flag)", c.MaxRoomsGlobal)
+	}
+	if c.MaxConnectionsGlobal != 1234 {
+		t.Errorf("MaxConnectionsGlobal = %d, want 1234 (flag)", c.MaxConnectionsGlobal)
+	}
+	if c.PeerDeadlineSec != 77 {
+		t.Errorf("PeerDeadlineSec = %d, want 77 (flag)", c.PeerDeadlineSec)
+	}
+}
+
+func TestLoadWithOverridesStringAndBool(t *testing.T) {
+	validBaseEnv(t)
+	setEnv(t, "LISTEN_ADDR", ":9090")
+	setEnv(t, "CLOUDFLARE_MODE", "true")
+
+	listen := ":7777"
+	cf := false
+	c, err := LoadWithOverrides(FlagOverrides{
+		ListenAddr:     &listen,
+		CloudflareMode: &cf,
+	})
+	if err != nil {
+		t.Fatalf("LoadWithOverrides: %v", err)
+	}
+	if c.ListenAddr != ":7777" {
+		t.Errorf("ListenAddr = %q, want :7777 (flag)", c.ListenAddr)
+	}
+	if c.CloudflareMode {
+		t.Errorf("CloudflareMode = true, want false (flag)")
+	}
+}
+
+func TestLoadWithOverridesOriginsAndSecret(t *testing.T) {
+	// Flag supplies the required secret + origins even though env vars are
+	// unset, and overrides the shard.
+	os.Unsetenv("SERVER_SECRET")
+	os.Unsetenv("ALLOWED_ORIGINS")
+	secret := "0123456789abcdef0123456789abcdef0123456789abcdef"
+	origins := "https://flag.example.com"
+	shard := "z"
+	c, err := LoadWithOverrides(FlagOverrides{
+		ServerSecret:   &secret,
+		AllowedOrigins: &origins,
+		ShardName:      &shard,
+	})
+	if err != nil {
+		t.Fatalf("LoadWithOverrides: %v", err)
+	}
+	if string(c.ServerSecret) != secret {
+		t.Errorf("ServerSecret mismatch")
+	}
+	if len(c.AllowedOrigins) != 1 || c.AllowedOrigins[0] != "https://flag.example.com" {
+		t.Errorf("AllowedOrigins = %v, want [https://flag.example.com]", c.AllowedOrigins)
+	}
+	if c.ShardName != "z" {
+		t.Errorf("ShardName = %q, want z", c.ShardName)
+	}
+}
+
+func TestLoadWithOverridesValidationStillRuns(t *testing.T) {
+	validBaseEnv(t)
+	// A flag override that violates a startup invariant must still be rejected.
+	bad := -1
+	if _, err := LoadWithOverrides(FlagOverrides{MaxRoomsGlobal: &bad}); err == nil {
+		t.Fatalf("expected validation error for negative MaxRoomsGlobal override")
+	}
+}
