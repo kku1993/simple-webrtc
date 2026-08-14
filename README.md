@@ -94,6 +94,23 @@ await guest.joinRoom({ roomId });
 // host.close(); guest.close();
 ```
 
+`joinRoom` normalizes the user-entered room id for you (Crockford base32
+fuzzy decoding: case-insensitive, `O→0`, `I→1`, `L→1`) before sending it to
+the server, so callers do not need to preprocess the input. If you want to
+display the canonical form to the user — e.g. to render `ta0000` instead of
+the `TA OOOO` they typed — use the exported `normalizeRoomId` helper, which
+applies the same transform without validating or rejecting:
+
+```ts
+import { normalizeRoomId } from "@simple-webrtc/client";
+
+normalizeRoomId("TA OOOO"); // "ta 0000"
+normalizeRoomId("Il1");     // "1111"
+```
+
+The helper never throws; the server remains the single source of truth for
+validation. See `docs/ROOM_ID_SPEC.md` §"Frontend handling".
+
 Notes:
 
 - `url` is the single-endpoint shorthand, good for a local server. Production
@@ -168,7 +185,10 @@ A copy of this example lives at `docs/signal-manifest.example.json`.
 Room ids are normalized (Crockford base32 fuzzy decoding) before the shard
 lookup, so a user typing `T1A230` reaches the same shard as `t1a230`. The
 shard whose `name` is the **longest** matching prefix wins, and a `"*"` entry is
-consulted only when no named shard matches.
+consulted only when no named shard matches. `joinRoom` applies this transform
+internally; the exported `normalizeRoomId` helper (see
+[Quickstart](#2-set-up-the-client)) exposes the same logic for display or
+pre-routing purposes.
 
 ### Pointing clients at it
 
