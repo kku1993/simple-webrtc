@@ -87,6 +87,13 @@ export { normalizeRoomId } from './roomid.js';
 
 export { PROTOCOL_VERSION } from './version.js';
 
+export {
+  getLocalizedErrorMessage,
+  type LocalizedMessageOptions,
+  type SupportedLocale,
+  type SignalCode,
+} from './i18n.js';
+
 // The client manifest: shard directory.
 export {
   ManifestProvider,

@@ -139,6 +139,106 @@ Notes:
   off();
   ```
 
+## Error handling and localized messages
+
+`PeerConnection` emits protocol-level failures as `SignalingError` — via the
+`error` event, as rejections from `createRoom()` / `joinRoom()` / `rejoin()`,
+and from `close` when the socket closed without an `error-response`. Each
+`SignalingError` carries:
+
+- `code` — an `ErrorCode` (from an `error-response`) or a `CloseCode` (from a
+  socket close), per `docs/DESIGN.md`.
+- `retryable` and `retryAfterMs` — the server's retry guidance. **Prefer these
+  over hard-coded behavior**: the server ships the policy in the payload so new
+  codes can be added without breaking old clients.
+
+```ts
+import { PeerConnection, SignalingError, ErrorCode } from "@simple-webrtc/client";
+
+const peer = new PeerConnection({ url: "wss://signal.example/v1/signal" });
+
+peer.on("error", (err: SignalingError) => {
+  console.error("code", err.code, "retryable", err.retryable);
+  if (err.retryable) {
+    // The client reconnects automatically for retryable socket closes; this
+    // is for surfacing UI (e.g. a spinner), not for driving retries yourself.
+  } else {
+    // Terminal — show the user a message and stop.
+  }
+});
+
+try {
+  await peer.createRoom();
+} catch (err) {
+  if (err instanceof SignalingError && err.code === ErrorCode.ROOM_FULL) {
+    // surface to user
+  }
+}
+```
+
+### Localized user-facing messages
+
+The client ships a helper that turns an error/close code into a translated,
+user-facing string — so applications do not have to maintain their own
+translation tables for protocol errors:
+
+```ts
+import {
+  getLocalizedErrorMessage,
+  SignalingError,
+  type SignalCode,
+} from "@simple-webrtc/client";
+
+// In your error handler:
+peer.on("error", (err: SignalingError) => {
+  const locale = navigator.language; // e.g. "zh-Hans", "en-GB", "fr"
+  const msg = getLocalizedErrorMessage(err.code, locale, {
+    retryable: err.retryable, // pass server guidance so the retry prompt is correct
+  });
+  showToast(msg);
+});
+```
+
+`getLocalizedErrorMessage(code, locale, opts?)` resolves the locale with BCP 47
+fallback: it tries the full tag (e.g. `zh-Hant-TW`), then strips subtags
+(`zh-Hant`, then `zh`), then falls back to `en`. For a bare `zh` with no script
+subtag, the Simplified Chinese bundle is used as the default. Lookup is
+case-insensitive.
+
+When the code is retryable, a per-locale "please retry" prompt is appended to
+the message **in the matched locale's language** — e.g. `"The room was not
+found. Please try again."` in English, `"未找到该房间。 请重试。"` in Simplified
+Chinese. Pass `opts.retryable` from the `SignalingError` so the server's
+guidance wins; when omitted, retryability is derived from a built-in table
+mirroring `docs/DESIGN.md`.
+
+Supported locales: `en`, `en-US`, `en-GB`, `zh-Hans`, `zh-Hant`, `fr`, `de`,
+`it`, `ar`, `es`. The `code` parameter is typed as `SignalCode`
+(= `ErrorCode | CloseCode`), so the compiler guides you toward known codes and
+the message tables are checked for exhaustiveness at build time — adding a new
+enum value without a translation is a compile error. Unknown numeric codes the
+server may add in the future can be passed via `code as SignalCode` and fall
+back to a generic per-locale "an unexpected error occurred" message.
+
+```ts
+import { getLocalizedErrorMessage, ErrorCode, CloseCode } from "@simple-webrtc/client";
+
+getLocalizedErrorMessage(ErrorCode.ROOM_NOT_FOUND, "zh-Hans");
+// "未找到该房间。 请重试。"  (retryable → retry prompt appended)
+
+getLocalizedErrorMessage(ErrorCode.ROOM_CLOSED, "fr");
+// "Le salon a été fermé."  (not retryable → no retry prompt)
+
+getLocalizedErrorMessage(CloseCode.SERVER_SHUTTING_DOWN, "de");
+// "Der Server wird heruntergefahren. Bitte versuchen Sie es erneut."
+
+getLocalizedErrorMessage(ErrorCode.RATE_LIMITED, "en", { retryable: false });
+// "You are being rate limited."  (explicit override drops the retry prompt)
+```
+
+The helper is a pure function with no runtime dependencies, so it is safe to
+use in any environment the client supports (browsers and Node >= 22).
+
 ## Shard manifest
 
 The signaling backend is a set of single-process shards. A room lives entirely
