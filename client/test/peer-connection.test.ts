@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { PeerConnection, SignalingError } from '../src/peer-connection.js';
 import type { PeerConnectionEvents, PeerStatus } from '../src/peer-connection.js';
 import { CloseCode, ErrorCode } from '../src/types.js';
+import { PROTOCOL_VERSION } from '../src/version.js';
 import { createFakeHarness, type FakeHarness, type FakePeer } from './fakes.js';
 
 // --- helpers ---------------------------------------------------------------
@@ -111,6 +112,79 @@ function joinRoomResponse(roomId: string, rejoinToken: string, guestEpoch: strin
 }
 
 // --- tests -----------------------------------------------------------------
+
+test('handshake messages include protocolVersion', async () => {
+  const h = createFakeHarness();
+  const conn = makeConn(h);
+
+  // create-room
+  const created = conn.createRoom();
+  const createMsg = await waitForMessage(h, 'create-room');
+  assert.equal(createMsg['protocolVersion'], PROTOCOL_VERSION);
+  h.ws.receiveMessage(createRoomResponse('room-1', 'tok-host', createMsg['hostEpoch'] as string));
+  await created;
+
+  // join-room
+  const conn2 = makeConn(h);
+  const joined = conn2.joinRoom({ roomId: 'room-1' });
+  const joinMsg = await waitForMessage(h, 'join-room');
+  assert.equal(joinMsg['protocolVersion'], PROTOCOL_VERSION);
+  h.ws.receiveMessage(joinRoomResponse('room-1', 'tok-guest', 'g1', createMsg['hostEpoch'] as string));
+  await joined;
+
+  // rejoin-room (via rejoin)
+  const conn3 = makeConn(h);
+  const rejoined = conn3.rejoin({
+    roomId: 'room-1',
+    role: 'host',
+    rejoinToken: 'tok-host',
+    hostEpoch: createMsg['hostEpoch'] as string,
+    guestEpoch: null,
+  });
+  const rejoinMsg = await waitForMessage(h, 'rejoin-room');
+  assert.equal(rejoinMsg['protocolVersion'], PROTOCOL_VERSION);
+  h.ws.receiveMessage({
+    type: 'rejoin-room-response',
+    roomId: 'room-1',
+    role: 'host',
+    recreated: false,
+    peerConnected: false,
+    hostEpoch: createMsg['hostEpoch'] as string,
+    guestEpoch: null,
+    peerDeadlineAt: ISO_SOON,
+    peerDeadlineInSeconds: 600,
+    roomExpiresAt: ISO_FUTURE,
+    roomExpiresInSeconds: 5400,
+    rejoinTokenExpiresAt: ISO_FUTURE,
+  });
+  await rejoined;
+});
+
+test('UNSUPPORTED_PROTOCOL_VERSION error is terminal and non-retryable', async () => {
+  const h = createFakeHarness();
+  const conn = makeConn(h);
+
+  const created = conn.createRoom();
+  const createMsg = await waitForMessage(h, 'create-room');
+  // Server rejects with UNSUPPORTED_PROTOCOL_VERSION (1402).
+  h.ws.receiveMessage({
+    type: 'error-response',
+    requestId: createMsg['requestId'],
+    errorCode: ErrorCode.UNSUPPORTED_PROTOCOL_VERSION,
+    message: 'protocol version mismatch: client major 0, server major 1',
+    retryable: false,
+  });
+
+  // Handshake errors reject the promise (they are not emitted as 'error'
+  // events — only non-handshake errors are). The caller gets a
+  // SignalingError with the server's code and retryable flag.
+  await assert.rejects(created, (err: unknown) => {
+    assert.ok(err instanceof SignalingError);
+    assert.equal(err.code, ErrorCode.UNSUPPORTED_PROTOCOL_VERSION);
+    assert.equal(err.retryable, false);
+    return true;
+  });
+});
 
 test('host: createRoom → guest-joined → signal relay → connect → peer-connected', async () => {
   const h = createFakeHarness();

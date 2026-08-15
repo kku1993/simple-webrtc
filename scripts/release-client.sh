@@ -105,6 +105,42 @@ if (pkg.version !== '${version}') {
     console.log('${ROOT_PKG} version already ${version}');
 }
 "
+
+# --- sync version into client/package.json -----------------------------------
+
+CLIENT_PKG="${CLIENT_DIR}/package.json"
+node -e "
+const fs = require('fs');
+const pkg = JSON.parse(fs.readFileSync('${CLIENT_PKG}', 'utf8'));
+if (pkg.version !== '${version}') {
+    pkg.version = '${version}';
+    fs.writeFileSync('${CLIENT_PKG}', JSON.stringify(pkg, null, 2) + '\n');
+    console.log('Updated ${CLIENT_PKG} version -> ${version}');
+} else {
+    console.log('${CLIENT_PKG} version already ${version}');
+}
+"
+
+# --- stamp PROTOCOL_VERSION into client/src/version.ts -----------------------
+
+VERSION_TS="${CLIENT_DIR}/src/version.ts"
+node -e "
+const fs = require('fs');
+let src = fs.readFileSync('${VERSION_TS}', 'utf8');
+const re = /export const PROTOCOL_VERSION = '([^']*)';/;
+const match = src.match(re);
+if (!match) {
+    console.error('Could not find PROTOCOL_VERSION in ${VERSION_TS}');
+    process.exit(1);
+}
+if (match[1] === '${version}') {
+    console.log('${VERSION_TS} PROTOCOL_VERSION already ${version}');
+} else {
+    src = src.replace(re, \"export const PROTOCOL_VERSION = '${version}';\");
+    fs.writeFileSync('${VERSION_TS}', src);
+    console.log('Updated ${VERSION_TS} PROTOCOL_VERSION -> ${version}');
+}
+"
 echo
 
 # --- build -------------------------------------------------------------------

@@ -123,6 +123,7 @@ type Envelope struct {
 type CreateRoomMsg struct {
 	Type                     string `json:"type"`
 	RequestID                string `json:"requestId,omitempty"`
+	ProtocolVersion          string `json:"protocolVersion"`
 	HostEpoch                string `json:"hostEpoch"`
 	GuestPassword            string `json:"guestPassword,omitempty"`
 	CloudflareTurnstileToken string `json:"cloudflareTurnstileToken,omitempty"`
@@ -130,19 +131,21 @@ type CreateRoomMsg struct {
 
 // JoinRoomMsg is the client→server join-room message.
 type JoinRoomMsg struct {
-	Type         string `json:"type"`
-	RequestID    string `json:"requestId,omitempty"`
-	RoomID       string `json:"roomId"`
-	GuestEpoch   string `json:"guestEpoch"`
+	Type          string `json:"type"`
+	RequestID     string `json:"requestId,omitempty"`
+	ProtocolVersion string `json:"protocolVersion"`
+	RoomID        string `json:"roomId"`
+	GuestEpoch    string `json:"guestEpoch"`
 	GuestPassword string `json:"guestPassword,omitempty"`
 }
 
 // RejoinRoomMsg is the client→server rejoin-room message.
 type RejoinRoomMsg struct {
-	Type       string `json:"type"`
-	RequestID  string `json:"requestId,omitempty"`
-	RejoinToken string `json:"rejoinToken"`
-	Epoch      string `json:"epoch"`
+	Type            string `json:"type"`
+	RequestID       string `json:"requestId,omitempty"`
+	ProtocolVersion string `json:"protocolVersion"`
+	RejoinToken     string `json:"rejoinToken"`
+	Epoch           string `json:"epoch"`
 }
 
 // SignalMsg is the client→server signal message.

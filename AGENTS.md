@@ -40,6 +40,22 @@ client in `docs/DESIGN.md`.
 - `loadtest/` — containerized load test harness (generator + runner). See
   `loadtest/README.md`; results live in `docs/LOAD_TEST_RESULTS.md`.
 
+## Versioning
+
+The repo-root `VERSION` file (a single `major.minor.patch` line) is the source
+of truth for both the server and the client. `scripts/build.sh` stamps it into
+the server binary via `-ldflags`; `scripts/release-client.sh` syncs it into
+`package.json`, `client/package.json`, and `client/src/version.ts`.
+
+**Any non-backward-compatible change to the protocol or the client API must
+increment the major version number.** This includes: new required fields on
+existing wire messages, removed or renamed fields, changed message semantics,
+new required handshake fields, changed error/retry semantics, or breaking
+changes to the client's public API. The server rejects clients whose major
+version differs with `UNSUPPORTED_PROTOCOL_VERSION` (1402, not retryable) —
+see `server/internal/server/server.go` `checkProtocolVersion` and
+`client/src/peer-connection.ts` for the handshake `protocolVersion` field.
+
 ## Build / test
 
 ```sh
@@ -111,6 +127,9 @@ than depending on `simple-peer` — see `docs/RTC_ENGINE_PLAN.md`. Full notes in
   a static object. ICE/TURN config is not carried here; the server mints
   short-lived TURN credentials and returns them in the handshake responses.
   See README §"Shard manifest" and §"TURN credentials".
+- `client/src/version.ts` — `PROTOCOL_VERSION` constant, stamped from the
+  repo-root `VERSION` file by `scripts/release-client.sh`. Sent in every
+  handshake message so the server can reject major-version mismatches.
 - `client/src/index.ts` — public barrel.
 - `client/test/` — `node:test` suite. `fakes.ts` provides a fake WebSocket and a
   fake peer for protocol tests; `rtc-fakes.ts` provides a fake
@@ -154,10 +173,12 @@ The client has **no runtime dependencies**. Keep it that way.
 ### Protocol behaviors implemented
 
 - `createRoom` (host) / `joinRoom` (guest) / `rejoin` (recovery from a
-  persisted session). `joinRoom` normalizes the user-entered room id via
-  Crockford base32 fuzzy decoding (case-insensitive, `O→0`, `I→1`, `L→1`)
-  without rejecting malformed ids — the backend owns validation per
-  `docs/ROOM_ID_SPEC.md` §"Frontend handling".
+  persisted session). Every handshake message carries `protocolVersion` (from
+  `client/src/version.ts`); the server rejects a major-version mismatch with
+  `UNSUPPORTED_PROTOCOL_VERSION` (1402, not retryable). `joinRoom` normalizes
+  the user-entered room id via Crockford base32 fuzzy decoding
+  (case-insensitive, `O→0`, `I→1`, `L→1`) without rejecting malformed ids —
+  the backend owns validation per `docs/ROOM_ID_SPEC.md` §"Frontend handling".
 - Host waits for `guest-joined` before building the initiator peer; guest
   builds the non-initiator peer immediately on join.
 - `signal` ↔ `signal-response` relay with per-(slot,epoch) `seq`.
@@ -172,7 +193,7 @@ The client has **no runtime dependencies**. Keep it that way.
   (`peer-reset`), keeps it on `peer-rejoined`; roles/initiator never change.
   Data channel handles survive the rebuild.
 - `SIGNAL_BUFFER_OVERFLOW` → rebuild with new epoch; `INVALID_REJOIN_TOKEN` /
-  `ROOM_CLOSED` / `ROOM_EXPIRED` → terminal.
+  `ROOM_CLOSED` / `ROOM_EXPIRED` / `UNSUPPORTED_PROTOCOL_VERSION` → terminal.
 - Any number of application data channels with independent ordering and
   reliability, declared via `dataChannels` or opened at runtime. The initiator
   creates them and the responder binds by label, so the two sides cannot

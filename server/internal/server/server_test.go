@@ -25,6 +25,7 @@ import (
 	"github.com/kku1993/simple-webrtc-server/internal/room"
 	"github.com/kku1993/simple-webrtc-server/internal/token"
 	"github.com/kku1993/simple-webrtc-server/internal/tombstone"
+	"github.com/kku1993/simple-webrtc-server/internal/version"
 )
 
 // lockedBuffer is a concurrency-safe bytes.Buffer suitable for capturing log
@@ -639,5 +640,156 @@ func TestServerPipelinedFirstMessage(t *testing.T) {
 	}
 	if m["type"] != "create-room-response" {
 		t.Fatalf("got %v, want create-room-response", m["type"])
+	}
+}
+
+// TestProtocolVersionCheck exercises the major-version gate on handshake
+// messages. The server's version.Major() is -1 ("dev") by default, which skips
+// the check; these tests temporarily stamp a real version so the gate is live.
+func TestProtocolVersionCheck(t *testing.T) {
+	original := version.Version
+	t.Cleanup(func() { version.Version = original })
+
+	tests := []struct {
+		name           string
+		serverVersion  string
+		clientVersion  string
+		wantError      bool
+		wantErrorCode  protocol.ErrorCode
+		wantResponse   bool
+	}{
+		{
+			name:          "matching major accepted",
+			serverVersion: "0.8.1",
+			clientVersion: "0.8.1",
+			wantResponse:  true,
+		},
+		{
+			name:          "matching major different minor accepted",
+			serverVersion: "0.8.1",
+			clientVersion: "0.7.0",
+			wantResponse:  true,
+		},
+		{
+			name:          "major mismatch rejected",
+			serverVersion: "1.0.0",
+			clientVersion: "0.8.1",
+			wantError:     true,
+			wantErrorCode: protocol.ErrUnsupportedProtocolVersion,
+		},
+		{
+			name:          "missing protocolVersion rejected",
+			serverVersion: "0.8.1",
+			clientVersion: "",
+			wantError:     true,
+			wantErrorCode: protocol.ErrUnsupportedProtocolVersion,
+		},
+		{
+			name:          "invalid protocolVersion rejected",
+			serverVersion: "0.8.1",
+			clientVersion: "abc",
+			wantError:     true,
+			wantErrorCode: protocol.ErrUnsupportedProtocolVersion,
+		},
+		{
+			name:          "dev server skips check when version missing",
+			serverVersion: "dev",
+			clientVersion: "",
+			wantResponse:  true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			version.Version = tt.serverVersion
+			hs, _ := newTestServer(t, testConfig())
+
+			host := dial(t, hs)
+			defer host.Close()
+
+			msg := map[string]any{"type": "create-room", "hostEpoch": "h1"}
+			if tt.clientVersion != "" {
+				msg["protocolVersion"] = tt.clientVersion
+			}
+			sendMsg(t, host, msg)
+
+			resp := recvMsg(t, host)
+			if tt.wantError {
+				if resp["type"] != "error-response" {
+					t.Fatalf("got %v, want error-response", resp["type"])
+				}
+				code := int(resp["errorCode"].(float64))
+				if protocol.ErrorCode(code) != tt.wantErrorCode {
+					t.Errorf("errorCode = %d, want %d", code, tt.wantErrorCode)
+				}
+				if resp["retryable"] != false {
+					t.Errorf("expected retryable=false for version mismatch")
+				}
+			} else if tt.wantResponse {
+				if resp["type"] != "create-room-response" {
+					t.Fatalf("got %v, want create-room-response", resp["type"])
+				}
+			}
+		})
+	}
+}
+
+// TestProtocolVersionCheckJoinRoom verifies the version gate also applies to
+// join-room, not just create-room.
+func TestProtocolVersionCheckJoinRoom(t *testing.T) {
+	original := version.Version
+	t.Cleanup(func() { version.Version = original })
+	version.Version = "1.0.0"
+
+	hs, _ := newTestServer(t, testConfig())
+
+	// Create a room with a matching-version host.
+	host := dial(t, hs)
+	defer host.Close()
+	sendMsg(t, host, map[string]any{
+		"type": "create-room", "hostEpoch": "h1", "protocolVersion": "1.0.0",
+	})
+	cr := recvMsg(t, host)
+	roomID := cr["roomId"].(string)
+
+	// Guest with a mismatched major should be rejected.
+	guest := dial(t, hs)
+	defer guest.Close()
+	sendMsg(t, guest, map[string]any{
+		"type": "join-room", "roomId": roomID, "guestEpoch": "g1",
+		"protocolVersion": "0.8.1",
+	})
+	resp := recvMsg(t, guest)
+	if resp["type"] != "error-response" {
+		t.Fatalf("got %v, want error-response", resp["type"])
+	}
+	code := int(resp["errorCode"].(float64))
+	if protocol.ErrorCode(code) != protocol.ErrUnsupportedProtocolVersion {
+		t.Errorf("errorCode = %d, want %d", code, protocol.ErrUnsupportedProtocolVersion)
+	}
+}
+
+// TestProtocolVersionCheckRejoinRoom verifies the version gate also applies to
+// rejoin-room.
+func TestProtocolVersionCheckRejoinRoom(t *testing.T) {
+	original := version.Version
+	t.Cleanup(func() { version.Version = original })
+	version.Version = "1.0.0"
+
+	hs, _ := newTestServer(t, testConfig())
+
+	c := dial(t, hs)
+	defer c.Close()
+	sendMsg(t, c, map[string]any{
+		"type": "rejoin-room", "rejoinToken": "tok", "epoch": "e1",
+		"protocolVersion": "0.8.1",
+	})
+	resp := recvMsg(t, c)
+	if resp["type"] != "error-response" {
+		t.Fatalf("got %v, want error-response", resp["type"])
+	}
+	code := int(resp["errorCode"].(float64))
+	if protocol.ErrorCode(code) != protocol.ErrUnsupportedProtocolVersion {
+		t.Errorf("errorCode = %d, want %d", code, protocol.ErrUnsupportedProtocolVersion)
 	}
 }

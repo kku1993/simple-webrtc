@@ -37,6 +37,7 @@ export interface ServerMessageBase {
 
 export interface CreateRoomMessage extends ClientMessageBase {
   type: 'create-room';
+  protocolVersion: string;
   hostEpoch: string;
   guestPassword?: string;
   cloudflareTurnstileToken?: string;
@@ -44,6 +45,7 @@ export interface CreateRoomMessage extends ClientMessageBase {
 
 export interface JoinRoomMessage extends ClientMessageBase {
   type: 'join-room';
+  protocolVersion: string;
   roomId: string;
   guestEpoch: string;
   guestPassword?: string;
@@ -51,6 +53,7 @@ export interface JoinRoomMessage extends ClientMessageBase {
 
 export interface RejoinRoomMessage extends ClientMessageBase {
   type: 'rejoin-room';
+  protocolVersion: string;
   rejoinToken: string;
   epoch: string;
 }

@@ -85,6 +85,8 @@ export { Transport, type WebSocketFactory, type WebSocketLike, parseFrame } from
 
 export { normalizeRoomId } from './roomid.js';
 
+export { PROTOCOL_VERSION } from './version.js';
+
 // The client manifest: shard directory.
 export {
   ManifestProvider,

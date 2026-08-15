@@ -168,6 +168,17 @@ the server closes the connection with `4001` / `HANDSHAKE_TIMEOUT`. A connection
 that has not been attached to a room slot holds no room state and must not be
 allowed to linger.
 
+### Protocol version check
+
+Every handshake message (`create-room`, `join-room`, `rejoin-room`) carries a
+`protocolVersion` string (e.g. `"0.8.1"`) matching the repo-root `VERSION` file.
+The server compares the **major** component of the client's version against its
+own stamped version. If the majors differ, or the field is missing or
+unparseable, the server rejects with `UNSUPPORTED_PROTOCOL_VERSION` (1402, not
+retryable) — the client must upgrade. When the server is built without ldflags
+(`version.Version == "dev"`, as in `go test`), the check is skipped so
+development and test builds are not gated.
+
 Sending a second handshake message on an already-attached connection is
 `UNEXPECTED_STATE` ("connection already attached"). This is **not** fatal: the
 server answers with an `error-response` and leaves the connection attached and
@@ -256,6 +267,7 @@ Creates a new room and takes the host slot.
 {
   type: "create-room";
   requestId?: string;
+  protocolVersion: string;            // client version, e.g. "0.8.1"; major must match server
   hostEpoch: string;                  // 128 bits, base64url
   guestPassword?: string;             // omit for no password
   cloudflareTurnstileToken?: string;  // required if the server has Turnstile enabled
@@ -297,6 +309,7 @@ Takes the guest slot of an existing room.
 {
   type: "join-room";
   requestId?: string;
+  protocolVersion: string;  // client version, e.g. "0.8.1"; major must match server
   roomId: string;
   guestEpoch: string;
   guestPassword?: string;  // required iff the room was created with one
@@ -353,6 +366,7 @@ has lost the room, **rebuilds it from the token**.
 {
   type: "rejoin-room";
   requestId?: string;
+  protocolVersion: string;  // client version, e.g. "0.8.1"; major must match server
   rejoinToken: string;
   epoch: string;       // the epoch for the slot named in your token
 }

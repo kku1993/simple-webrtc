@@ -23,6 +23,7 @@ import (
 	"github.com/kku1993/simple-webrtc-server/internal/requestlog"
 	"github.com/kku1993/simple-webrtc-server/internal/room"
 	"github.com/kku1993/simple-webrtc-server/internal/turnstile"
+	"github.com/kku1993/simple-webrtc-server/internal/version"
 )
 
 // Origin authorization is enforced explicitly in handleSignal via
@@ -225,6 +226,9 @@ func (s *Server) dispatch(sess *room.Session, c *wsConn, raw []byte) (protocol.E
 		if err := json.Unmarshal(raw, &m); err != nil {
 			return env, errResp(protocol.ErrMalformedMessage, "malformed create-room: "+err.Error(), env.RequestID)
 		}
+		if r := checkProtocolVersion(m.ProtocolVersion, env.RequestID); r != nil {
+			return env, *r
+		}
 		turnstileOK := true
 		if s.cfg.TurnstileSecretKey != "" {
 			if m.CloudflareTurnstileToken == "" {
@@ -243,12 +247,18 @@ func (s *Server) dispatch(sess *room.Session, c *wsConn, raw []byte) (protocol.E
 		if err := json.Unmarshal(raw, &m); err != nil {
 			return env, errResp(protocol.ErrMalformedMessage, "malformed join-room: "+err.Error(), env.RequestID)
 		}
+		if r := checkProtocolVersion(m.ProtocolVersion, env.RequestID); r != nil {
+			return env, *r
+		}
 		return env, s.registry.JoinRoom(sess, m)
 
 	case protocol.TypeRejoinRoom:
 		var m protocol.RejoinRoomMsg
 		if err := json.Unmarshal(raw, &m); err != nil {
 			return env, errResp(protocol.ErrMalformedMessage, "malformed rejoin-room: "+err.Error(), env.RequestID)
+		}
+		if r := checkProtocolVersion(m.ProtocolVersion, env.RequestID); r != nil {
+			return env, *r
 		}
 		return env, s.registry.RejoinRoom(sess, m)
 
@@ -280,6 +290,35 @@ func (s *Server) dispatch(sess *room.Session, c *wsConn, raw []byte) (protocol.E
 
 func errResp(code protocol.ErrorCode, msg, reqID string) room.Result {
 	return room.Result{Response: protocol.NewError(code, msg, reqID, nil)}
+}
+
+// checkProtocolVersion verifies that the client's protocolVersion major
+// matches the server's. Returns nil when the check passes (or is skipped in
+// dev mode — when the server binary was built without ldflags, version.Major()
+// is -1 and the check is bypassed so `go test` and plain `go build` work).
+func checkProtocolVersion(clientVersion, requestID string) *room.Result {
+	serverMajor := version.Major()
+	if serverMajor < 0 {
+		return nil // dev mode — version not stamped
+	}
+	if clientVersion == "" {
+		r := errResp(protocol.ErrUnsupportedProtocolVersion,
+			"missing protocolVersion", requestID)
+		return &r
+	}
+	clientMajor := version.MajorFromString(clientVersion)
+	if clientMajor < 0 {
+		r := errResp(protocol.ErrUnsupportedProtocolVersion,
+			fmt.Sprintf("invalid protocolVersion %q", clientVersion), requestID)
+		return &r
+	}
+	if clientMajor != serverMajor {
+		r := errResp(protocol.ErrUnsupportedProtocolVersion,
+			fmt.Sprintf("protocol version mismatch: client major %d, server major %d",
+				clientMajor, serverMajor), requestID)
+		return &r
+	}
+	return nil
 }
 
 // logWS emits a JSON request-log entry for one inbound WebSocket message and

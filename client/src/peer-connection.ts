@@ -17,6 +17,7 @@ import { type RoomSession, type SessionStore, RoomSessionStore, MemorySessionSto
 import { Transport, type WebSocketFactory, type WebSocketLike } from './transport.js';
 import { SequenceCounter, generateEpoch, generateRequestId, fullJitterBackoff } from './util.js';
 import { normalizeRoomId } from './roomid.js';
+import { PROTOCOL_VERSION } from './version.js';
 import {
   type ManifestOptions,
   type ShardEntry,
@@ -576,6 +577,7 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
     const hostEpoch = generateEpoch();
     const message: ClientMessage = {
       type: 'create-room',
+      protocolVersion: PROTOCOL_VERSION,
       hostEpoch,
       ...(input.guestPassword !== undefined ? { guestPassword: input.guestPassword } : {}),
       ...(input.cloudflareTurnstileToken !== undefined
@@ -613,6 +615,7 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
     if (pendingShard) await pendingShard;
     const message: ClientMessage = {
       type: 'join-room',
+      protocolVersion: PROTOCOL_VERSION,
       roomId,
       guestEpoch,
       ...(input.guestPassword !== undefined ? { guestPassword: input.guestPassword } : {}),
@@ -644,7 +647,7 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
     // Capture the previous other-epoch BEFORE applyHandshakeResponse overwrites
     // the persisted session, so the epoch-change comparison is correct.
     const prevOtherEpoch = this.otherEpochOf(session.role, session);
-    const message: ClientMessage = { type: 'rejoin-room', rejoinToken: session.rejoinToken, epoch };
+    const message: ClientMessage = { type: 'rejoin-room', protocolVersion: PROTOCOL_VERSION, rejoinToken: session.rejoinToken, epoch };
     const res = (await this.handshake('rejoin', message)) as RejoinRoomResponse;
     this.applyHandshakeResponse(res, {
       myEpoch: epoch,
@@ -1611,6 +1614,7 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
     const prevOtherEpoch = this.otherEpochOf(this.state.role, this.state);
     const message: ClientMessage = {
       type: 'rejoin-room',
+      protocolVersion: PROTOCOL_VERSION,
       rejoinToken: this.state.rejoinToken,
       epoch,
     };
@@ -1645,6 +1649,11 @@ export class PeerConnection extends Emitter<PeerConnectionEvents> {
       if (err.code === 1104 /* ROOM_CLOSED */ || err.code === 1105 /* ROOM_EXPIRED */) {
         if (this.state) this.sessionStore.delete(this.state.roomId);
         this.failTerminal(err, err.message);
+        return;
+      }
+      if (err.code === 1402 /* UNSUPPORTED_PROTOCOL_VERSION */) {
+        if (this.state) this.sessionStore.delete(this.state.roomId);
+        this.failTerminal(err, 'unsupported protocol version');
         return;
       }
       if (err.code === 1004 /* UNEXPECTED_STATE — "connection already attached" */) {
