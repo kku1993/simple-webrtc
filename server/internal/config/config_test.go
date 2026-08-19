@@ -178,6 +178,58 @@ func TestOriginSubdomainWildcardCoexistsWithExact(t *testing.T) {
 	}
 }
 
+// TestOriginMultipleWildcards covers the operator-supplied configuration of
+// several independent wildcard subdomain origins in a single ALLOWED_ORIGINS
+// value, e.g. "https://*.example.com,https://*.abc.com". Each wildcard must
+// match its own suffix and only its own suffix; cross-matches must fail.
+func TestOriginMultipleWildcards(t *testing.T) {
+	c := Config{AllowedOrigins: []string{"https://*.example.com", "https://*.abc.com"}}
+	cases := []struct {
+		origin string
+		want   bool
+	}{
+		{"https://a.example.com", true},
+		{"https://sub.a.example.com", true},
+		{"https://b.abc.com", true},
+		{"https://sub.b.abc.com", true},
+		{"https://example.com", false},    // apex not covered by *.example.com
+		{"https://abc.com", false},        // apex not covered by *.abc.com
+		{"https://a.example.org", false},  // different TLD
+		{"http://a.example.com", false},   // scheme mismatch
+		{"https://a.example.com:8443", true},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := c.OriginAllowed(tc.origin); got != tc.want {
+			t.Errorf("OriginAllowed(%q) = %v, want %v", tc.origin, got, tc.want)
+		}
+	}
+}
+
+// TestLoadAcceptsMultipleWildcardOrigins verifies that a comma-separated
+// ALLOWED_ORIGINS value with several scheme-qualified wildcard entries parses
+// and validates cleanly, and that each wildcard is honored after Load.
+func TestLoadAcceptsMultipleWildcardOrigins(t *testing.T) {
+	validBaseEnv(t)
+	setEnv(t, "ALLOWED_ORIGINS", "https://*.example.com,https://*.abc.com")
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(c.AllowedOrigins) != 2 {
+		t.Fatalf("AllowedOrigins = %v, want 2 entries", c.AllowedOrigins)
+	}
+	if !c.OriginAllowed("https://a.example.com") {
+		t.Errorf("first wildcard should match a.example.com")
+	}
+	if !c.OriginAllowed("https://b.abc.com") {
+		t.Errorf("second wildcard should match b.abc.com")
+	}
+	if c.OriginAllowed("https://a.example.org") {
+		t.Errorf("neither wildcard should match a.example.org")
+	}
+}
+
 func TestValidateOriginEntry(t *testing.T) {
 	valid := []string{
 		"*",
