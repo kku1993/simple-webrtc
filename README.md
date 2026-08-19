@@ -53,7 +53,10 @@ Health and Prometheus metrics are served alongside the WebSocket endpoint:
 - `GET /v1/signal` — the WebSocket endpoint clients connect to
 
 Use `ALLOWED_ORIGINS="*"` to disable origin checking (the server logs a
-warning; do not do this in production). See `docs/DESIGN.md`
+warning; do not do this in production). Wildcard subdomains are supported with
+the `scheme://*.suffix` form, e.g. `ALLOWED_ORIGINS="https://*.example.com"`
+accepts `https://a.example.com` and `https://b.example.com` (but not the apex
+`https://example.com` — list it separately). See `docs/DESIGN.md`
 §"Configuration reference" for the full env var list (rate limits, room TTL,
 peer deadline, Cloudflare Turnstile, etc.).
 

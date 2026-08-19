@@ -846,9 +846,25 @@ tombstoned ID cannot be handed out again while the tombstone exists.
 WebSockets are **not** protected by the same-origin policy or CORS. Without an
 origin check, any page on the internet can open rooms on this server.
 
-The server validates the `Origin` header against `allowedOrigins` (exact string
-match, no wildcards within an entry) **during the HTTP handshake, before the
-upgrade**, and rejects with HTTP `403` and body error code `ORIGIN_NOT_ALLOWED`.
+The server validates the `Origin` header against `allowedOrigins` **during the
+HTTP handshake, before the upgrade**, and rejects with HTTP `403` and body
+error code `ORIGIN_NOT_ALLOWED`.
+
+Each entry is matched as follows:
+
+- The single entry `*` disables the check entirely (see below).
+- An entry of the form `scheme://*.suffix` is a **wildcard subdomain** match:
+  it accepts any origin with the same scheme whose host ends with `.suffix`
+  and has at least one label before it. So `https://*.example.com` matches
+  `https://a.example.com` and `https://sub.a.example.com` but **not**
+  `https://example.com` (the apex must be listed separately). If the entry
+  specifies a port (`https://*.example.com:8443`) the origin's port must match
+  it; an entry without a port accepts any port.
+- Any other entry is an exact string match.
+
+The wildcard must be the leading label of the host (`https://www.*.example.com`
+is rejected at startup); malformed wildcard entries are a startup error so a
+typo cannot silently become an entry that matches nothing.
 
 `allowedOrigins` may be set to the single entry `*` to disable the check, in
 which case the server logs a warning at startup. Leaving it unset is a startup
@@ -1075,7 +1091,7 @@ the process is losing state.
 |---|---|---|---|
 | `listenAddr` | `LISTEN_ADDR` | `:8080` | |
 | `serverSecret` | `SERVER_SECRET` | *(required)* | ≥32 bytes. **Server refuses to start without it** |
-| `allowedOrigins` | `ALLOWED_ORIGINS` | *(required)* | Comma-separated; `*` disables the check |
+| `allowedOrigins` | `ALLOWED_ORIGINS` | *(required)* | Comma-separated. `*` disables the check; `scheme://*.suffix` matches subdomains (e.g. `https://*.example.com`); otherwise exact match |
 | `shardName` | `SHARD_NAME` | *(required)* | Single alphabetic Crockford base32 char (`a-z` excluding `i`, `l`, `o`, `u`). Baked into every generated `roomId` for edge routing |
 | `trustedProxyCount` | `TRUSTED_PROXY_COUNT` | `0` | `X-Forwarded-For` is ignored when 0 |
 | `cloudflareMode` | `CLOUDFLARE_MODE` | `false` | Prefer `CF-Connecting-IP` |

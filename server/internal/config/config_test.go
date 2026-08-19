@@ -129,6 +129,103 @@ func TestOriginWildcard(t *testing.T) {
 	}
 }
 
+func TestOriginSubdomainWildcard(t *testing.T) {
+	c := Config{AllowedOrigins: []string{"https://*.example.com"}}
+	cases := []struct {
+		origin string
+		want   bool
+	}{
+		{"https://a.example.com", true},
+		{"https://b.example.com", true},
+		{"https://sub.a.example.com", true},
+		{"https://example.com", false}, // bare apex does not match
+		{"https://evil.example.org", false},
+		{"http://a.example.com", false}, // scheme mismatch
+		{"https://a.example.com:8443", true},
+		{"", false},
+		{"https://.example.com", false}, // empty leading label
+	}
+	for _, tc := range cases {
+		if got := c.OriginAllowed(tc.origin); got != tc.want {
+			t.Errorf("OriginAllowed(%q) = %v, want %v", tc.origin, got, tc.want)
+		}
+	}
+}
+
+func TestOriginSubdomainWildcardWithPort(t *testing.T) {
+	c := Config{AllowedOrigins: []string{"https://*.example.com:8443"}}
+	if !c.OriginAllowed("https://a.example.com:8443") {
+		t.Errorf("expected matching port allowed")
+	}
+	if c.OriginAllowed("https://a.example.com:9000") {
+		t.Errorf("expected non-matching port rejected")
+	}
+	if c.OriginAllowed("https://a.example.com") {
+		t.Errorf("expected missing port rejected when pattern specifies one")
+	}
+}
+
+func TestOriginSubdomainWildcardCoexistsWithExact(t *testing.T) {
+	c := Config{AllowedOrigins: []string{"https://example.com", "https://*.app.example.com"}}
+	if !c.OriginAllowed("https://example.com") {
+		t.Errorf("exact entry should match")
+	}
+	if !c.OriginAllowed("https://x.app.example.com") {
+		t.Errorf("wildcard entry should match subdomain")
+	}
+	if c.OriginAllowed("https://x.example.com") {
+		t.Errorf("wildcard only covers *.app.example.com, not *.example.com")
+	}
+}
+
+func TestValidateOriginEntry(t *testing.T) {
+	valid := []string{
+		"*",
+		"https://example.com",
+		"https://example.com:8080",
+		"https://*.example.com",
+		"https://*.example.com:8443",
+		"http://*.sub.example.org",
+	}
+	for _, e := range valid {
+		if err := validateOriginEntry(e); err != nil {
+			t.Errorf("validateOriginEntry(%q): unexpected error: %v", e, err)
+		}
+	}
+	invalid := []string{
+		"*.example.com",            // no scheme
+		"https://*.",               // empty suffix
+		"https://www.*.example.com", // wildcard not leading label
+		"https://*",                // empty suffix
+		"://*.example.com",         // empty scheme
+	}
+	for _, e := range invalid {
+		if err := validateOriginEntry(e); err == nil {
+			t.Errorf("validateOriginEntry(%q): expected error, got nil", e)
+		}
+	}
+}
+
+func TestLoadRejectsMalformedWildcardOrigin(t *testing.T) {
+	validBaseEnv(t)
+	setEnv(t, "ALLOWED_ORIGINS", "https://*.example.com,https://www.*.example.com")
+	if _, err := Load(); err == nil {
+		t.Fatalf("expected error for malformed wildcard entry")
+	}
+}
+
+func TestLoadAcceptsWildcardOrigins(t *testing.T) {
+	validBaseEnv(t)
+	setEnv(t, "ALLOWED_ORIGINS", "https://example.com,https://*.app.example.com")
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !c.OriginAllowed("https://x.app.example.com") {
+		t.Errorf("wildcard entry should match subdomain after Load")
+	}
+}
+
 func TestParseOrigins(t *testing.T) {
 	got := parseOrigins(" a , b ,, c ")
 	want := []string{"a", "b", "c"}

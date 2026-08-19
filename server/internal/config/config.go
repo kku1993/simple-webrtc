@@ -8,6 +8,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -336,6 +337,43 @@ func parseOrigins(v string) []string {
 	return out
 }
 
+// validateOriginEntry checks a single ALLOWED_ORIGINS entry for well-formedness.
+// Accepted forms:
+//   - "*" (disables the check)
+//   - an exact origin, e.g. "https://example.com" (no "*")
+//   - a wildcard subdomain entry "scheme://*.suffix", where the "*" is the
+//     leading label of the host and suffix is non-empty (e.g.
+//     "https://*.example.com"). A wildcard anywhere else is rejected so a typo
+//     does not silently become an entry that matches nothing.
+func validateOriginEntry(entry string) error {
+	if entry == "*" {
+		return nil
+	}
+	if !strings.Contains(entry, "*") {
+		return nil
+	}
+	sep := strings.Index(entry, "://")
+	if sep < 0 {
+		return fmt.Errorf("entry %q contains \"*\" but no scheme; use \"scheme://*.suffix\" for a wildcard subdomain", entry)
+	}
+	hostPart := entry[sep+3:]
+	if !strings.HasPrefix(hostPart, "*.") {
+		return fmt.Errorf("entry %q: wildcard must be the leading label of the host (e.g. \"https://*.example.com\")", entry)
+	}
+	suffix := hostPart[2:] // after "*."
+	// Strip an optional port from the suffix before checking it's non-empty.
+	if i := strings.LastIndex(suffix, ":"); i >= 0 {
+		suffix = suffix[:i]
+	}
+	if suffix == "" {
+		return fmt.Errorf("entry %q: wildcard suffix is empty", entry)
+	}
+	if u, err := url.Parse(entry); err != nil || u.Scheme == "" {
+		return fmt.Errorf("entry %q is not a valid origin", entry)
+	}
+	return nil
+}
+
 // Validate enforces the startup invariants described in the design doc.
 func (c Config) Validate() error {
 	if len(c.ServerSecret) < 32 {
@@ -343,6 +381,11 @@ func (c Config) Validate() error {
 	}
 	if len(c.AllowedOrigins) == 0 {
 		return errors.New("ALLOWED_ORIGINS must be set; use \"*\" to disable origin checking")
+	}
+	for _, o := range c.AllowedOrigins {
+		if err := validateOriginEntry(o); err != nil {
+			return fmt.Errorf("ALLOWED_ORIGINS: %w", err)
+		}
 	}
 	if !roomid.IsValidShardName(c.ShardName) {
 		return errors.New("SHARD_NAME must be set to a single alphabetic Crockford base32 character (a-z excluding i, l, o, u)")
@@ -434,9 +477,17 @@ func (c Config) TombstoneTtl() time.Duration {
 	return time.Duration(c.TombstoneTtlSec) * time.Second
 }
 
-// OriginAllowed reports whether the given Origin header is accepted. The check
-// is exact string match against each configured entry, except that the single
-// entry "*" disables the check entirely.
+// OriginAllowed reports whether the given Origin header is accepted. Each
+// configured entry is matched as follows:
+//
+//   - The single entry "*" disables the check entirely (every origin allowed).
+//   - An entry of the form "scheme://*.suffix" is a wildcard subdomain match:
+//     it accepts any origin with the same scheme whose host ends with ".suffix"
+//     and has at least one label before it. So "https://*.example.com" matches
+//     "https://a.example.com" and "https://sub.a.example.com" but not
+//     "https://example.com". If the entry specifies a port, the origin's port
+//     must match it; if the entry omits the port, any port is accepted.
+//   - Any other entry is an exact string match.
 func (c Config) OriginAllowed(origin string) bool {
 	for _, o := range c.AllowedOrigins {
 		if o == "*" {
@@ -445,8 +496,49 @@ func (c Config) OriginAllowed(origin string) bool {
 		if o == origin {
 			return true
 		}
+		if originMatchesWildcard(o, origin) {
+			return true
+		}
 	}
 	return false
+}
+
+// originMatchesWildcard reports whether the configured entry pattern is a
+// wildcard subdomain entry (scheme://*.suffix) that matches origin. Non-
+// wildcard patterns return false; callers handle them via exact match.
+func originMatchesWildcard(pattern, origin string) bool {
+	// A wildcard entry must have the "*." marker in the host portion. We
+	// require it to be a leading label of the host, e.g. "https://*.example.com".
+	sep := strings.Index(pattern, "://")
+	if sep < 0 {
+		return false
+	}
+	hostPart := pattern[sep+3:]
+	if !strings.HasPrefix(hostPart, "*.") {
+		return false
+	}
+	pu, err := url.Parse(pattern)
+	if err != nil {
+		return false
+	}
+	ou, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	if pu.Scheme != ou.Scheme {
+		return false
+	}
+	ph, pport := pu.Hostname(), pu.Port()
+	oh, oport := ou.Hostname(), ou.Port()
+	if pport != "" && pport != oport {
+		return false
+	}
+	// ph is "*.suffix"; the suffix to match is ".suffix".
+	suffix := ph[1:] // includes the leading "."
+	if !strings.HasSuffix(oh, suffix) {
+		return false
+	}
+	return len(oh) > len(suffix) // at least one label before the suffix
 }
 
 // OriginsCheckDisabled reports whether the operator explicitly disabled the
